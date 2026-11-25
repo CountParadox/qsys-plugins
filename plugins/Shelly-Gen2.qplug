@@ -7,17 +7,22 @@
 -- Nothing has to be configured on the Shelly itself.
 --
 -- Requirements: Q-SYS Designer 9.8 or newer (Lua WebSocket), Shelly authentication OFF.
+--
+-- Presence Gen4: occupancy lives in dynamic "presencezone:<id>" components, which
+-- Shelly.GetStatus leaves out, so they are read with Shelly.GetComponents (dynamic_only)
+-- on connect and on every heartbeat, as well as from NotifyStatus. Zone 1 is the sensor's
+-- main zone; further zones follow in id order. Illuminance comes from "illuminance:0".
 
 PluginInfo = {
   Name = "Shelly~Gen2+ Device",
-  Version = "0.1.0",
-  BuildVersion = "0.1.0.0",
+  Version = "0.2.0",
+  BuildVersion = "0.2.0.0",
   Id = "856d8d71-9de9-440c-8409-975483df1332",
   Author = "qsys-plugins",
-  Description = "Shelly Gen2/Gen3/Gen4/Pro relays, inputs, dimmers and covers over the local RPC WebSocket",
+  Description = "Shelly Gen2/Gen3/Gen4/Pro relays, inputs, dimmers, covers and Presence Gen4 over the local RPC WebSocket",
 }
 
-local MAX_SWITCH, MAX_INPUT, MAX_LIGHT, MAX_COVER = 4, 4, 4, 2
+local MAX_SWITCH, MAX_INPUT, MAX_LIGHT, MAX_COVER, MAX_ZONE = 4, 4, 4, 2, 4
 
 function GetColor(props)
   return { 0, 140, 200 }
@@ -34,6 +39,8 @@ function GetProperties()
     { Name = "Lights (dimmer channels)", Type = "integer", Min = 0, Max = MAX_LIGHT, Value = 0 },
     { Name = "Covers", Type = "integer", Min = 0, Max = MAX_COVER, Value = 0 },
     { Name = "Power Metering", Type = "boolean", Value = true },
+    { Name = "Presence Zones", Type = "integer", Min = 0, Max = MAX_ZONE, Value = 0 },
+    { Name = "Illuminance", Type = "boolean", Value = false },
     { Name = "Debug", Type = "boolean", Value = false },
   }
 end
@@ -45,6 +52,8 @@ local function counts(props)
     light = props["Lights (dimmer channels)"].Value,
     cover = props["Covers"].Value,
     pm = props["Power Metering"].Value,
+    zone = props["Presence Zones"].Value,
+    lux = props["Illuminance"].Value,
   }
 end
 
@@ -87,6 +96,14 @@ function GetControls(props)
     add({ Name = "Cover" .. i .. "Close", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 })
     add({ Name = "Cover" .. i .. "Position", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, UserPin = true, PinStyle = "Both", Count = 1 })
     add({ Name = "Cover" .. i .. "State", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 })
+  end
+  for i = 1, n.zone do
+    add({ Name = "Zone" .. i .. "Occupied", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = "Zone" .. i .. "Objects", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 20, UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = "Zone" .. i .. "Name", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 })
+  end
+  if n.lux then
+    add({ Name = "Illuminance", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 })
   end
   return c
 end
@@ -156,6 +173,18 @@ function GetControlLayout(props)
     y = y + ROW
     label("Position / State"); ctl("Cover" .. i .. "Position", "Cover " .. i .. "~Position", LBL, 110, "Fader")
     ctl("Cover" .. i .. "State", "Cover " .. i .. "~State", LBL + 116, 100); y = y + ROW + 8
+  end
+  if n.zone > 0 or n.lux then
+    box("Presence", n.zone + (n.lux and 1 or 0))
+    for i = 1, n.zone do
+      label("Zone " .. i)
+      ctl("Zone" .. i .. "Occupied", "Presence~Zone " .. i .. " Occupied", LBL, 18)
+      ctl("Zone" .. i .. "Objects", "Presence~Zone " .. i .. " People", LBL + 26, 40, "Text")
+      ctl("Zone" .. i .. "Name", "Presence~Zone " .. i .. " Name", LBL + 72, 148)
+      y = y + ROW
+    end
+    if n.lux then label("Illuminance"); ctl("Illuminance", "Presence~Illuminance", LBL, 150); y = y + ROW end
+    y = y + 8
   end
   return layout, graphics
 end
@@ -272,6 +301,24 @@ if Controls then
     if num(s.current_pos) and not levelHold["Cover" .. i] then ctlFor("Cover" .. i .. "Position").Value = s.current_pos end
   end
 
+  -- Presence zones: device zone id (e.g. 200) -> zone row (1..n.zone).
+  local zoneRow = {}
+  local mainZoneId = nil
+
+  local function applyZone(id, s)
+    local row = zoneRow[id]
+    if not row then return end
+    if type(s.value) == "boolean" then ctlFor("Zone" .. row .. "Occupied").Boolean = s.value end
+    if num(s.num_objects) then ctlFor("Zone" .. row .. "Objects").Value = s.num_objects end
+  end
+
+  local function applyIlluminance(s)
+    if not n.lux then return end
+    local text = type(s.illumination) == "string" and s.illumination or nil
+    if num(s.lux) then text = string.format("%d lx", math.floor(s.lux + 0.5)) .. (text and (" (" .. text .. ")") or "") end
+    if text then ctlFor("Illuminance").String = text end
+  end
+
   function ApplyStatus(status)
     if not isTable(status) then return end
     for key, s in pairs(status) do
@@ -281,9 +328,43 @@ if Controls then
         elseif kind == "input" then applyInput(i, s)
         elseif kind == "light" then applyLight(i, s)
         elseif kind == "cover" then applyCover(i, s)
+        elseif kind == "presencezone" then applyZone(i - 1, s)
+        elseif kind == "illuminance" and i == 1 then applyIlluminance(s)
         end
       end
     end
+  end
+
+  -- Shelly.GetComponents result -> zone rows (main zone first, then by id) and their status.
+  function ApplyComponents(r)
+    if not isTable(r) or not isTable(r.components) then return end
+    local zones = {}
+    for _, c in ipairs(r.components) do
+      if isTable(c) and type(c.key) == "string" then
+        local kind, i = comp(c.key)
+        if kind == "presencezone" then zones[#zones + 1] = { id = i - 1, comp = c } end
+      end
+    end
+    table.sort(zones, function(a, b)
+      if a.id == mainZoneId then return true end
+      if b.id == mainZoneId then return false end
+      return a.id < b.id
+    end)
+    zoneRow = {}
+    for row, z in ipairs(zones) do
+      if row > n.zone then break end
+      zoneRow[z.id] = row
+      local cfg = z.comp.config
+      local name = isTable(cfg) and type(cfg.name) == "string" and cfg.name or ("Zone " .. z.id)
+      ctlFor("Zone" .. row .. "Name").String = name
+      if isTable(z.comp.status) then applyZone(z.id, z.comp.status) end
+    end
+    for row = #zones + 1, n.zone do ctlFor("Zone" .. row .. "Name").String = "(no zone)" end
+  end
+
+  local function refreshZones()
+    if n.zone == 0 then return end
+    Rpc("Shelly.GetComponents", { dynamic_only = true, include = { "status", "config" } }, function(r) ApplyComponents(r) end)
   end
 
   local EVENT_CONTROL = {
@@ -329,6 +410,15 @@ if Controls then
         setStatus(2, "GetStatus: " .. tostring(err.message))
       end
     end)
+    if n.zone > 0 then
+      Rpc("Presence.GetConfig", nil, function(r)
+        if isTable(r) and type(r.main_zone) == "string" then
+          local kind, i = comp(r.main_zone)
+          if kind == "presencezone" then mainZoneId = i - 1 end
+        end
+        refreshZones()
+      end)
+    end
   end
 
   local function scheduleReconnect()
@@ -414,6 +504,7 @@ if Controls then
       return
     end
     Rpc("Shelly.GetStatus", nil, function(r) if isTable(r) then ApplyStatus(r); setStatus(0, "") end end)
+    refreshZones()
     local hb = (Controls.HeartbeatPath.String or ""):match("^%s*(.-)%s*$")
     if hb ~= "" then
       if hb:sub(1, 1) ~= "/" then hb = "/" .. hb end
