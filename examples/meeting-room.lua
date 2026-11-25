@@ -16,7 +16,7 @@ this script only adds the wall-switch behaviour.
 -- Configuration ----------------------------------------------------------------
 local SHELLY_NAME     = "Shelly Meeting Room Switch" -- Shelly Gen2+ plugin with the wall switch
 local SHELLY_INPUT    = 1                            -- which input on that Shelly (1-based)
-local DALI_NAME       = "DALI Gateway"               -- Lunatone DALI-2 IoT plugin
+local DALI_NAME       = "SmartCore DALI"             -- Atios SmartCore DALI plugin
 local DALI_ROW        = 1                            -- group row in the DALI plugin for this room
 local SCENE_DOUBLE    = 1                            -- DALI scene for double press
 local HOLD_DELAY_S    = 0.4                          -- hold this long before dimming starts
