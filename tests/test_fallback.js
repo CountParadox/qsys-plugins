@@ -3,7 +3,7 @@ const fs = require("fs");
 const assert = require("assert");
 const vm = require("vm");
 
-let up = 0, handler = null, endpoint = null, calls = [], deviceOn = false;
+let up = 0, handler = null, endpoint = null, calls = [], level = 0, answerOk = true;
 const ctx = {
   print: () => {},
   JSON,
@@ -11,9 +11,10 @@ const ctx = {
     getComponentStatus: () => ({ uptime: up }),
     addEventHandler: (fn) => { handler = fn; },
     call: (method, params, cb) => {
-      calls.push({ method, params });
-      if (method === "HTTP.GET") cb({ code: 200, body: JSON.stringify({ id: 1, features: { switchable: { status: deviceOn } } }) }, 0, "");
-      else cb({ code: 200 }, 0, "");
+      const body = JSON.parse(params.body);
+      calls.push({ method, url: params.url, body });
+      if (body.wait_response) cb({ code: 200, body: JSON.stringify({ success: answerOk, data: answerOk ? level : 0 }) }, 0, "");
+      else cb({ code: 200, body: "{}" }, 0, "");
     },
   },
   HTTPServer: { registerEndpoint: (name, fn) => { assert.strictEqual(name, "hb"); endpoint = fn; } },
@@ -23,31 +24,36 @@ vm.runInContext(fs.readFileSync("shelly-scripts/qsys-dali-fallback.js", "utf8"),
 
 const press = (event, component = "input:0") => handler({ component, info: { event } });
 const hb = () => endpoint({}, { send() {} });
-const posts = () => calls.filter((c) => c.method === "HTTP.Request");
+const commands = () => calls.filter((c) => !c.body.wait_response);
+const last = () => commands()[commands().length - 1].body.data;
 let n = 0;
 const ok = (c, m) => { assert(c, m); n++; };
 
 up = 10; press("single_push");
-ok(posts().length === 0, "boot grace: Q-SYS assumed alive");
+ok(calls.length === 0, "boot grace: Q-SYS assumed alive");
 
 up = 100; hb(); up = 110; press("single_push");
-ok(posts().length === 0, "heartbeat fresh: nothing sent");
+ok(calls.length === 0, "heartbeat fresh: nothing sent");
 
-up = 200; deviceOn = false; press("single_push");
-ok(posts().length === 1, "heartbeat stale: fallback sends");
-const p = posts()[0].params;
-ok(p.url === "http://192.168.1.60/group/0/control" && JSON.parse(p.body).switchable === true, "toggles off->on");
+up = 200; level = 0; press("single_push");
+ok(calls[0].url === "http://192.168.1.60/api/dali/iface" && calls[0].body.wait_response === true
+  && calls[0].body.data[0] === 0x01 && calls[0].body.data[1] === 0xA0, "queries actual level of the probe fitting");
+ok(commands().length === 1 && last()[0] === 0x83 && last()[1] === 0x0A, "off -> GO TO LAST ACTIVE LEVEL to group 1");
 
-deviceOn = true; press("single_push");
-ok(JSON.parse(posts()[1].params.body).switchable === false, "toggles on->off");
+level = 200; press("single_push");
+ok(last()[0] === 0x83 && last()[1] === 0x00, "on -> OFF");
+
+answerOk = false; press("single_push");
+ok(last()[1] === 0x0A, "no answer -> switch on");
 
 press("long_push");
-ok(JSON.parse(posts()[2].params.body).dimmable === 100, "long press -> 100%");
+ok(last()[1] === 0x05, "long press -> RECALL MAX");
 
+const before = calls.length;
 press("single_push", "input:1");
-ok(posts().length === 3, "other inputs ignored");
+ok(calls.length === before, "other inputs ignored");
 
 hb(); press("single_push");
-ok(posts().length === 3, "heartbeat restored: back to Q-SYS");
+ok(calls.length === before, "heartbeat restored: back to Q-SYS");
 
 console.log(`fallback: ${n} checks passed`);

@@ -1,0 +1,1020 @@
+-- Atios SmartCore DALI plugin for Q-SYS
+--
+-- Talks to the SmartCore the way Atios's own Home Assistant integration does
+-- (github.com/Atios-AG/homeassistant-smartcore):
+--
+--   * Commands are raw DALI-2 forward frames. They go as "daliFrame" on the DALI IP
+--     Interface WebSocket (ws://<ip>/) while it is up, otherwise as POST /api/dali/iface.
+--   * Status follows the bus: the SmartCore echoes every frame on the bus (ours, its own,
+--     other masters') as "daliMonitor" on the same socket. Every frame is applied to a
+--     mirror of each fitting's level, like the SmartCore firmware does. Levels are read
+--     with QUERY ACTUAL LEVEL at start-up, after a reconnect and when a frame alone does
+--     not tell the result.
+--   * Names, groups and scenes come from the SmartCore device model, GET /api/dali/nvm.
+--   * Built-in inputs 1-12 come from the web UI socket ws://<ip>/ws (firmware 3.2.64+,
+--     no web password).
+--
+-- SmartCore set-up: System > DALI > "DALI IP Interface" ON. Without it, commands still
+-- work but there is no live feedback (the plugin falls back to polling levels).
+-- The DALI IP socket serves ONE client: the newest connection takes it over. Do not run
+-- Home Assistant's Atios integration, DALI Cockpit or a second copy of this plugin
+-- against the same SmartCore at the same time.
+
+PluginInfo = {
+  Name = "Atios~SmartCore DALI",
+  Version = "0.2.0",
+  BuildVersion = "0.2.0.0",
+  Id = "15b16ecf-d66b-4cc4-b506-b605e84457f9",
+  Author = "qsys-plugins",
+  Description = "DALI groups, scenes and built-in inputs of an Atios SmartCore",
+}
+
+local INPUT_COUNT = 12
+
+function GetColor(props)
+  return { 240, 170, 0 }
+end
+
+function GetPrettyName(props)
+  return "Atios SmartCore DALI\n" .. PluginInfo.Version
+end
+
+function GetProperties()
+  return {
+    { Name = "Group Rows", Type = "integer", Min = 1, Max = 16, Value = 4 },
+    { Name = "Tunable White", Type = "boolean", Value = false },
+    { Name = "Built-in Inputs", Type = "boolean", Value = true },
+    { Name = "Debug", Type = "boolean", Value = false },
+  }
+end
+
+function GetControls(props)
+  local rows = props["Group Rows"].Value
+  local tw = props["Tunable White"].Value
+  local c = {
+    { Name = "IPAddress", ControlType = "Text", UserPin = true, PinStyle = "Input", Count = 1 },
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "Online", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "LiveFeedback", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "BusScan", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "Firmware", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
+    { Name = "DeviceCount", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
+    { Name = "LastBusEvent", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "AllOn", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 },
+    { Name = "AllOff", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 },
+    { Name = "Refresh", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 },
+  }
+  local function add(t) c[#c + 1] = t end
+  for i = 1, rows do
+    local p = "Group" .. i
+    add({ Name = p .. "Address", ControlType = "Text", UserPin = false, Count = 1 })
+    add({ Name = p .. "Name", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = p .. "Members", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 })
+    add({ Name = p .. "On", ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both", Count = 1 })
+    add({ Name = p .. "Level", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, UserPin = true, PinStyle = "Both", Count = 1 })
+    add({ Name = p .. "Raise", ControlType = "Button", ButtonType = "Momentary", UserPin = true, PinStyle = "Input", Count = 1 })
+    add({ Name = p .. "Lower", ControlType = "Button", ButtonType = "Momentary", UserPin = true, PinStyle = "Input", Count = 1 })
+    add({ Name = p .. "Scene", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 15, UserPin = true, PinStyle = "Input", Count = 1 })
+    add({ Name = p .. "Recall", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 })
+    if tw then
+      add({ Name = p .. "Kelvin", ControlType = "Knob", ControlUnit = "Integer", Min = 2200, Max = 6500, UserPin = true, PinStyle = "Input", Count = 1 })
+    end
+  end
+  if props["Built-in Inputs"].Value then
+    for i = 1, INPUT_COUNT do
+      add({ Name = "Input" .. i, ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 })
+    end
+  end
+  return c
+end
+
+function GetControlLayout(props)
+  local rows = props["Group Rows"].Value
+  local tw = props["Tunable White"].Value
+  local inputs = props["Built-in Inputs"].Value
+  local layout, graphics = {}, {}
+  local ROW = 22
+  local y = 6
+  local width = tw and 760 or 690
+  local function text(t, x, w, align)
+    graphics[#graphics + 1] = { Type = "Text", Text = t, HTextAlign = align or "Center", FontSize = 11,
+      Position = { x, y }, Size = { w, ROW - 4 } }
+  end
+  local function ctl(name, pretty, x, w, style, legend)
+    layout[name] = { PrettyName = pretty, Position = { x, y }, Size = { w, ROW - 4 }, Style = style, Legend = legend }
+  end
+  local function box(title, h)
+    graphics[#graphics + 1] = { Type = "GroupBox", Text = title, Fill = { 242, 236, 224 }, StrokeWidth = 1,
+      Position = { 4, y }, Size = { width, h } }
+    y = y + 24
+  end
+
+  box("SmartCore", 26 + 5 * ROW)
+  text("IP Address", 10, 110, "Right"); ctl("IPAddress", "Setup~IP Address", 126, 150, "Text")
+  ctl("Refresh", "Setup~Refresh", 284, 70, "Button", "Refresh"); y = y + ROW
+  text("Status", 10, 110, "Right"); ctl("Status", "Status", 126, 420); y = y + ROW
+  text("Online / Live / Scan", 10, 110, "Right"); ctl("Online", "Online", 126, 18)
+  ctl("LiveFeedback", "Live Feedback", 160, 18); ctl("BusScan", "Bus Scan Running", 194, 18); y = y + ROW
+  text("FW / Fittings", 10, 110, "Right"); ctl("Firmware", "Info~Firmware", 126, 150); ctl("DeviceCount", "Info~Fittings", 284, 70)
+  text("Last bus event", 360, 90, "Right"); ctl("LastBusEvent", "Info~Last DALI-2 Event", 456, 200); y = y + ROW
+  text("Broadcast", 10, 110, "Right"); ctl("AllOn", "Broadcast~All On", 126, 70, "Button", "All On")
+  ctl("AllOff", "Broadcast~All Off", 202, 70, "Button", "All Off"); y = y + ROW + 10
+
+  box("Groups", 46 + rows * ROW)
+  text("DALI grp", 6, 56); text("Name", 66, 140); text("Fittings", 210, 50); text("On", 264, 40); text("Level", 308, 150)
+  text("- / +", 462, 56); text("Scene", 522, 100); if tw then text("Kelvin", 628, 120) end
+  y = y + ROW
+  for i = 1, rows do
+    local p, pn = "Group" .. i, "Group " .. i .. "~"
+    ctl(p .. "Address", pn .. "DALI Group (0-15)", 12, 44, "Text")
+    ctl(p .. "Name", pn .. "Name", 66, 140)
+    ctl(p .. "Members", pn .. "Fittings", 210, 50)
+    ctl(p .. "On", pn .. "On", 264, 40, "Button")
+    ctl(p .. "Level", pn .. "Level", 308, 150, "Fader")
+    ctl(p .. "Lower", pn .. "Lower", 462, 26, "Button", "-")
+    ctl(p .. "Raise", pn .. "Raise", 492, 26, "Button", "+")
+    ctl(p .. "Scene", pn .. "Scene", 522, 40, "Text")
+    ctl(p .. "Recall", pn .. "Recall Scene", 566, 54, "Button", "Recall")
+    if tw then ctl(p .. "Kelvin", pn .. "Colour Temp (K)", 628, 120, "Fader") end
+    y = y + ROW
+  end
+  y = y + 10
+
+  if inputs then
+    box("Built-in inputs", 26 + 2 * ROW)
+    for i = 1, INPUT_COUNT do
+      text(tostring(i), 10 + (i - 1) * 40, 30)
+    end
+    y = y + ROW - 4
+    for i = 1, INPUT_COUNT do
+      ctl("Input" .. i, "Built-in Input " .. i, 16 + (i - 1) * 40, 18)
+    end
+  end
+  return layout, graphics
+end
+
+if Controls then
+  local rapidjson = require("rapidjson")
+
+  local ROWS = Properties["Group Rows"].Value
+  local TW = Properties["Tunable White"].Value
+  local INPUTS = Properties["Built-in Inputs"].Value
+  local DEBUG = Properties["Debug"].Value
+
+  local RECONNECT_MIN, RECONNECT_MAX = 2, 60
+  local GREETING_TIMEOUT_S = 10   -- no DALI IP JSON after connecting: firmware does not stream
+  local ECHO_TIMEOUT_S = 15       -- frames sent but none echoed: stream taken over / dead
+  local FAILURES_OFFLINE = 3      -- HTTP requests in a row that did not reach the SmartCore
+  local POLL_S = 30               -- level poll while there is no live feedback
+  local QUERY_DELAY_S = 1.5       -- wait for fades before querying a level the bus did not tell
+  local RAMP_S = 0.2              -- UP / DOWN repeat while Raise / Lower is held
+  local LEASE_S = 10              -- built-in input monitor lease renewal
+  local QUIESCENT_TIMEOUT_S = 15 * 60
+
+  local MAX_LEVEL, MASK = 254, 0xFF
+
+  local function dbg(...) if DEBUG then print("[Atios]", ...) end end
+  local function isTable(v) return type(v) == "table" end
+  local function isInt(v) return math.type and math.type(v) == "integer" or (type(v) == "number" and v % 1 == 0) end
+  local function ip() return (Controls.IPAddress.String or ""):match("^%s*(.-)%s*$") end
+  local function now() return os.time() end
+
+  ---------------------------------------------------------------------------
+  -- DALI frames
+  ---------------------------------------------------------------------------
+  local OP = {
+    OFF = 0x00, UP = 0x01, DOWN = 0x02, STEP_UP = 0x03, STEP_DOWN = 0x04, RECALL_MAX = 0x05, RECALL_MIN = 0x06,
+    STEP_DOWN_AND_OFF = 0x07, ON_AND_STEP_UP = 0x08, GOTO_LAST_ACTIVE = 0x0A, CONTINUOUS_UP = 0x0B,
+    CONTINUOUS_DOWN = 0x0C, GOTO_SCENE = 0x10, RESET = 0x20, SET_MAX_LEVEL = 0x2A, SET_MIN_LEVEL = 0x2B,
+    SET_FADE_RATE = 0x2F, ADD_TO_GROUP = 0x60, REMOVE_FROM_GROUP = 0x70, QUERY_ACTUAL_LEVEL = 0xA0,
+    DT8_SET_TC = 0xE7, DT8_ACTIVATE = 0xE2,
+  }
+  local SPECIAL_DTR0, SPECIAL_DTR1, SPECIAL_ENABLE_DT = 0xA3, 0xC3, 0xC1
+
+  local function groupByte(g, command) return 0x80 | (g << 1) | (command and 1 or 0) end
+  local function shortByte(a, command) return (a << 1) | (command and 1 or 0) end
+  local BROADCAST_CMD = 0xFF
+
+  local function pctToDali(p)
+    p = math.floor(p + 0.5)
+    if p <= 0 then return 0 end
+    local v = math.floor(p / 100 * MAX_LEVEL + 0.5)
+    if v < 1 then v = 1 end
+    if v > MAX_LEVEL then v = MAX_LEVEL end
+    return v
+  end
+  local function daliToPct(v)
+    if not v or v <= 0 then return 0 end
+    local p = math.floor(v / MAX_LEVEL * 100 + 0.5)
+    if p < 1 then p = 1 end
+    return p
+  end
+
+  ---------------------------------------------------------------------------
+  -- Bus mirror: the level of each fitting, kept current from the frames on the bus
+  -- (port of gear_state.py from the Atios integration)
+  ---------------------------------------------------------------------------
+  local FADE_RATE_TABLE = { 365.0, 260.0, 185.0, 130.0, 95.0, 70.0, 50.0, 35.0, 25.0, 20.0, 15.0, 14.5, 10.0, 10.0, 10.0 }
+  local function fadeStep(rate)
+    local idx = ((rate - 1) & 0xFF) + 1
+    if idx > 15 then idx = 15 end
+    return math.floor(FADE_RATE_TABLE[idx] * 0.2)
+  end
+
+  Gears = {}            -- address -> { address, groups = {g = true}, min, max, physMin, fadeRate, scenes, level, lastActive }
+  GroupNames = {}       -- group -> name from the SmartCore
+  local groupLevels = {} -- level last sent to a group with no known members
+  local broadcastLevel = nil
+  local dtr0 = nil
+  local queryAddress = nil
+
+  local function clamp(g, v)
+    if v == 0 then return 0 end
+    if v < g.min then v = g.min end
+    if v > g.max then v = g.max end
+    return v
+  end
+
+  local function setGearLevel(g, v)
+    g.level = v
+    if v > 0 then g.lastActive = v end
+  end
+
+  local function step(g, level, op)
+    if op == OP.STEP_UP then
+      return (level >= g.min and level < g.max) and level + 1 or level
+    elseif op == OP.STEP_DOWN then
+      return (level > g.min and level <= g.max) and level - 1 or level
+    elseif op == OP.STEP_DOWN_AND_OFF then
+      if level > g.min and level <= g.max then return level - 1 end
+      return level == g.min and 0 or level
+    end
+    -- ON AND STEP UP
+    if level == 0 then return g.min end
+    if level >= g.min and level < g.max then return level + 1 end
+    return g.max
+  end
+
+  local function gearCommand(g, op, upd)
+    local level, new = g.level, nil
+    if op == OP.OFF then
+      new = 0
+    elseif op == OP.UP or op == OP.DOWN then
+      if level == nil then upd.query[g.address] = true
+      elseif op == OP.UP and level > 0 and level < g.max then new = math.min(level + fadeStep(g.fadeRate), g.max)
+      elseif op == OP.DOWN and level > g.min then new = math.max(level - fadeStep(g.fadeRate), g.min) end
+    elseif op == OP.STEP_UP or op == OP.STEP_DOWN or op == OP.STEP_DOWN_AND_OFF or op == OP.ON_AND_STEP_UP then
+      if level == nil then upd.query[g.address] = true else new = step(g, level, op) end
+    elseif op == OP.RECALL_MAX then
+      new = g.max
+    elseif op == OP.RECALL_MIN then
+      new = g.min
+    elseif op == OP.GOTO_LAST_ACTIVE then
+      if g.lastActive == nil then upd.query[g.address] = true else new = clamp(g, g.lastActive) end
+    elseif op >= OP.GOTO_SCENE and op <= OP.GOTO_SCENE + 15 then
+      local s = g.scenes[op - OP.GOTO_SCENE]
+      if s == nil then upd.query[g.address] = true
+      elseif s ~= MASK then new = (s == 0) and 0 or clamp(g, s) end
+    elseif op == OP.CONTINUOUS_UP or op == OP.CONTINUOUS_DOWN then
+      upd.query[g.address] = true
+    elseif op == OP.RESET then
+      g.min, g.max = g.physMin, MAX_LEVEL
+      upd.query[g.address] = true
+    elseif op == OP.SET_MAX_LEVEL and dtr0 then
+      g.max = math.min(math.max(dtr0, g.min), MAX_LEVEL)
+      if level and level > g.max then new = g.max end
+    elseif op == OP.SET_MIN_LEVEL and dtr0 then
+      g.min = math.min(math.max(dtr0, g.physMin), g.max)
+      if level and level > 0 and level < g.min then new = g.min end
+    elseif op == OP.SET_FADE_RATE and dtr0 then
+      g.fadeRate = dtr0 & 0x0F
+    elseif op >= OP.ADD_TO_GROUP and op <= OP.ADD_TO_GROUP + 15 then
+      g.groups[op - OP.ADD_TO_GROUP] = true
+    elseif op >= OP.REMOVE_FROM_GROUP and op <= OP.REMOVE_FROM_GROUP + 15 then
+      g.groups[op - OP.REMOVE_FROM_GROUP] = nil
+    end
+    if new ~= nil and new ~= level then
+      setGearLevel(g, new)
+      upd.changed = true
+    end
+  end
+
+  local function membersOf(group)
+    local list = {}
+    for _, g in pairs(Gears) do if g.groups[group] then list[#list + 1] = g end end
+    return list
+  end
+
+  -- Apply one forward/backward frame seen on the bus. Returns { changed = bool, query = {addr = true} }.
+  function MirrorApply(data, bits)
+    local upd = { changed = false, query = {} }
+    if bits == 8 and #data == 1 then
+      local a = queryAddress
+      queryAddress = nil
+      local g = a and Gears[a]
+      if g and data[1] >= 0 and data[1] <= MAX_LEVEL then setGearLevel(g, data[1]); upd.changed = true end
+      return upd
+    end
+    queryAddress = nil
+    if bits ~= 16 or #data ~= 2 then return upd end
+    local first, second = data[1], data[2]
+    if first == SPECIAL_DTR0 then dtr0 = second return upd end
+    local isBroadcast = first >= 0xFC
+    if not (first <= 0x9F or isBroadcast) then return upd end
+
+    local targets, group = {}, nil
+    if isBroadcast then
+      for _, g in pairs(Gears) do targets[#targets + 1] = g end
+    elseif first >= 0x80 then
+      group = (first >> 1) & 0x0F
+      targets = membersOf(group)
+    else
+      local g = Gears[first >> 1]
+      if g then targets = { g } end
+    end
+
+    local isCommand = (first & 1) == 1
+    if isCommand and second == OP.QUERY_ACTUAL_LEVEL and first < 0x80 then
+      queryAddress = first >> 1
+      return upd
+    end
+    for _, g in ipairs(targets) do
+      if isCommand then
+        gearCommand(g, second, upd)
+      elseif second ~= MASK then
+        setGearLevel(g, clamp(g, second))
+        upd.changed = true
+      end
+    end
+    -- Remember what a group / broadcast was told, for groups without known members.
+    local target
+    if isCommand then
+      if second == OP.OFF then target = 0 elseif second == OP.RECALL_MAX then target = MAX_LEVEL elseif second == OP.RECALL_MIN then target = 1 end
+    elseif second ~= MASK then
+      target = second
+    end
+    if target then
+      if isBroadcast then
+        broadcastLevel = target
+        for k in pairs(groupLevels) do groupLevels[k] = target end
+        upd.changed = true
+      elseif group then
+        groupLevels[group] = target
+        upd.changed = true
+      end
+    end
+    return upd
+  end
+
+  local function groupLevel(group)
+    local members = membersOf(group)
+    if #members == 0 then return groupLevels[group] or broadcastLevel, 0 end
+    local best
+    for _, g in ipairs(members) do
+      if g.level ~= nil and (best == nil or g.level > best) then best = g.level end
+    end
+    return best, #members
+  end
+
+  ---------------------------------------------------------------------------
+  -- UI state
+  ---------------------------------------------------------------------------
+  local levelHold = {}
+
+  local function groupNumber(i)
+    local v = tonumber(Controls["Group" .. i .. "Address"].String)
+    if v and v >= 0 and v <= 15 and v % 1 == 0 then return math.floor(v) end
+    return nil
+  end
+
+  function RefreshRows()
+    local total = 0
+    for _ in pairs(Gears) do total = total + 1 end
+    Controls.DeviceCount.String = tostring(total)
+    for i = 1, ROWS do
+      local p = "Group" .. i
+      local g = groupNumber(i)
+      if g == nil then
+        Controls[p .. "Name"].String = "(set group 0-15)"
+        Controls[p .. "Members"].String = "-"
+      else
+        Controls[p .. "Name"].String = GroupNames[g] or ("Group " .. g)
+        local lvl, count = groupLevel(g)
+        Controls[p .. "Members"].String = tostring(count)
+        if not levelHold[i] and lvl ~= nil then
+          Controls[p .. "On"].Boolean = lvl > 0
+          Controls[p .. "Level"].Value = daliToPct(lvl)
+        end
+      end
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- Connection state and status
+  ---------------------------------------------------------------------------
+  DaliSocket = nil   -- globals: keep the sockets alive for the garbage collector
+  InputSocket = nil
+  local wsGen, inGen = 0, 0
+  local greeted = false
+  local ipInterface = nil    -- SmartCore "DALI IP Interface" setting, nil = unknown
+  local streamLost = false
+  local silentFirmware = false
+  local echoPendingSince = nil
+  local httpFailures = 0
+  local busScan = false
+  local busScanUntil = 0
+  local inputsBlocked = false
+  local backoff = RECONNECT_MIN
+  local modelLoaded = false
+
+  local function streamLive()
+    return DaliSocket ~= nil and greeted and ipInterface == true and not streamLost
+  end
+
+  function UpdateStatus()
+    local code, text
+    if ip() == "" then
+      code, text = 3, "Enter the SmartCore IP address"
+    elseif httpFailures >= FAILURES_OFFLINE then
+      code, text = 2, "SmartCore not responding"
+    elseif silentFirmware then
+      code, text = 1, "SmartCore firmware sends no DALI IP events (update firmware); no live feedback"
+    elseif ipInterface == false then
+      code, text = 1, "Turn on System > DALI > DALI IP Interface on the SmartCore for live feedback"
+    elseif streamLost then
+      code, text = 1, "DALI IP stream lost (another client connected?), reconnecting"
+    elseif busScan then
+      code, text = 1, "DALI bus scan in progress, commands paused"
+    elseif (DaliSocket == nil or not greeted) and modelLoaded then
+      code, text = 1, "DALI IP socket not connected: control over HTTP, levels polled every 30 s"
+    elseif DaliSocket == nil or not greeted then
+      code, text = 5, "Connecting"
+    else
+      code, text = 0, ""
+    end
+    if code == 0 and inputsBlocked and INPUTS then
+      text = "Built-in inputs unavailable: SmartCore has a web password"
+    end
+    Controls.Status.Value = code
+    Controls.Status.String = text
+    Controls.Online.Boolean = (code == 0 or code == 1)
+    Controls.LiveFeedback.Boolean = streamLive()
+    Controls.BusScan.Boolean = busScan
+  end
+
+  ---------------------------------------------------------------------------
+  -- HTTP (one request at a time: the SmartCore serves /api/dali/iface from a single task)
+  ---------------------------------------------------------------------------
+  local httpQueue, httpBusy = {}, false
+
+  local function pumpHttp()
+    if httpBusy or #httpQueue == 0 then return end
+    local job = table.remove(httpQueue, 1)
+    httpBusy = true
+    local finished = false
+    job(function()
+      if finished then return end
+      finished = true
+      httpBusy = false
+      pumpHttp()
+    end)
+  end
+
+  local function enqueueHttp(job)
+    httpQueue[#httpQueue + 1] = job
+    pumpHttp()
+  end
+
+  local function base() return "http://" .. ip() end
+
+  local function recordHttp(reached)
+    local before = httpFailures >= FAILURES_OFFLINE
+    httpFailures = reached and 0 or httpFailures + 1
+    if before ~= (httpFailures >= FAILURES_OFFLINE) then UpdateStatus() end
+  end
+
+  local function httpGet(path, cb)
+    enqueueHttp(function(done)
+      if ip() == "" then done() return end
+      HttpClient.Download({
+        Url = base() .. path,
+        Timeout = 10,
+        EventHandler = function(_, code, data)
+          recordHttp(code ~= nil and code > 0)
+          local obj
+          if code == 200 and data then
+            local ok, v = pcall(rapidjson.decode, data)
+            if ok then obj = v end
+          end
+          cb(obj, code)
+          done()
+        end,
+      })
+    end)
+  end
+
+  local function httpPost(path, cb)
+    enqueueHttp(function(done)
+      if ip() == "" then done() return end
+      HttpClient.Upload({
+        Url = base() .. path, Method = "POST", Data = "", Timeout = 5,
+        EventHandler = function(_, code) if cb then cb(code) end done() end,
+      })
+    end)
+  end
+
+  ---------------------------------------------------------------------------
+  -- Sending frames
+  ---------------------------------------------------------------------------
+  local function isQuiescentFrame(f)
+    return f.bits == 24 and f.data[1] == 0xFF and f.data[2] == 0xFE
+  end
+
+  local function applyAndRefresh(data, bits)
+    local upd = MirrorApply(data, bits)
+    if upd.changed then RefreshRows() end
+    return upd
+  end
+
+  local queryQueued = {}
+  local scheduleQueries -- forward
+
+  local function sendHttpFrame(f, cb)
+    enqueueHttp(function(done)
+      if ip() == "" then done() return end
+      local live = streamLive()
+      HttpClient.Upload({
+        Url = base() .. "/api/dali/iface",
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Data = rapidjson.encode({ repeat_twice = f.twice or false, wait_response = f.wait or false, bits = f.bits, data = f.data }),
+        Timeout = 5,
+        EventHandler = function(_, code, body)
+          local reached = code ~= nil and code >= 200 and code < 300
+          recordHttp(reached)
+          local answer
+          if reached and f.wait and body then
+            local ok, obj = pcall(rapidjson.decode, body)
+            -- Without an answer the firmware still reports "data": 0, so trust only success = true.
+            if ok and isTable(obj) and obj.success == true and isInt(obj.data) then answer = obj.data end
+          end
+          if reached then
+            if f.wait then
+              if live and ipInterface and not echoPendingSince then echoPendingSince = now() end
+            elseif not live then
+              applyAndRefresh(f.data, f.bits) -- no echo will come: follow our own command
+            end
+          else
+            dbg("HTTP frame failed", code)
+          end
+          if cb then cb(answer, reached) end
+          done()
+        end,
+      })
+    end)
+  end
+
+  -- Send one DALI frame: f = { data = {..}, bits = 16, twice = bool, wait = bool }
+  function SendFrame(f, cb)
+    f.bits = f.bits or #f.data * 8
+    if busScan and not isQuiescentFrame(f) then
+      dbg("bus scan running, frame dropped")
+      if cb then cb(nil, false) end
+      return
+    end
+    -- Queries go over HTTP, which returns the answer directly. Commands use the socket when it is up.
+    if not f.wait and DaliSocket ~= nil and greeted then
+      local msg = { type = "daliFrame", data = { line = 0, numberOfBits = f.bits, daliData = f.data,
+        mode = { priority = 3, sendTwice = f.twice or false, waitForAnswer = false } } }
+      DaliSocket:Write(rapidjson.encode(msg), false)
+      if streamLive() then
+        if not echoPendingSince then echoPendingSince = now() end
+      else
+        applyAndRefresh(f.data, f.bits)
+      end
+      if cb then cb(nil, true) end
+      return
+    end
+    sendHttpFrame(f, cb)
+  end
+
+  local function sendGroup(group, op)
+    SendFrame({ data = { groupByte(group, true), op }, bits = 16 })
+  end
+
+  local function queryLevel(address)
+    if queryQueued[address] then return end
+    queryQueued[address] = true
+    SendFrame({ data = { shortByte(address, true), OP.QUERY_ACTUAL_LEVEL }, bits = 16, wait = true }, function(answer)
+      queryQueued[address] = nil
+      local g = Gears[address]
+      if g and answer and answer >= 0 and answer <= MAX_LEVEL then
+        setGearLevel(g, answer)
+        RefreshRows()
+      end
+    end)
+  end
+
+  local function queryAll()
+    for addr in pairs(Gears) do queryLevel(addr) end
+  end
+
+  local pendingQueries = {}
+  local queryTimer = Timer.New()
+  queryTimer.EventHandler = function()
+    queryTimer:Stop()
+    local list = pendingQueries
+    pendingQueries = {}
+    for a in pairs(list) do queryLevel(a) end
+  end
+  scheduleQueries = function(set)
+    local any = false
+    for a in pairs(set) do pendingQueries[a] = true; any = true end
+    if any then queryTimer:Stop(); queryTimer:Start(QUERY_DELAY_S) end
+  end
+
+  ---------------------------------------------------------------------------
+  -- Device model (NVRAM)
+  ---------------------------------------------------------------------------
+  local function intOr(v, d) if isInt(v) then return math.floor(v) end return d end
+
+  function LoadControlDevices(list)
+    local old = Gears
+    Gears, GroupNames = {}, {}
+    for _, d in ipairs(list) do
+      if isTable(d) and not d.collision and isInt(d.address) then
+        if d.is_group then
+          local g = d.address - 128
+          if g >= 0 and g <= 15 then GroupNames[g] = (type(d.name) == "string" and d.name ~= "") and d.name or ("Group " .. g) end
+        elseif d.address >= 0 and d.address <= 63 then
+          local gear = { address = math.floor(d.address), groups = {}, scenes = {},
+            min = intOr(d.min_level, 1), max = intOr(d.max_level, MAX_LEVEL),
+            physMin = intOr(d.physical_minimum, 1), fadeRate = intOr(d.fade_rate, 7) }
+          if isTable(d.gear_groups) then for _, g in ipairs(d.gear_groups) do if isInt(g) then gear.groups[math.floor(g)] = true end end end
+          if isTable(d.gear_scenes) then
+            for _, s in ipairs(d.gear_scenes) do
+              if isTable(s) and s.enabled == true and isInt(s.number) and isInt(s.level) then gear.scenes[math.floor(s.number)] = math.floor(s.level) end
+            end
+          end
+          local prev = old[gear.address]
+          if prev then gear.level, gear.lastActive = prev.level, prev.lastActive end
+          Gears[gear.address] = gear
+        end
+      end
+    end
+    RefreshRows()
+  end
+
+  local function loadNvm(after)
+    local devices, offset, pages = {}, 0, 0
+    local function page()
+      httpGet("/api/dali/nvm?section=control_devices&offset=" .. offset .. "&limit=4", function(obj)
+        if not isTable(obj) or obj.success ~= true then
+          if #devices > 0 then LoadControlDevices(devices) end
+          dbg("nvm read failed at offset", offset)
+          if after then after() end
+          return
+        end
+        local data = isTable(obj.data) and obj.data.control_devices
+        if isTable(data) then for _, d in ipairs(data) do devices[#devices + 1] = d end end
+        local pg = isTable(obj.pagination) and obj.pagination or {}
+        pages = pages + 1
+        if pg.has_more == true and pages < 32 then
+          offset = offset + intOr(pg.limit, 4)
+          page()
+        else
+          LoadControlDevices(devices)
+          modelLoaded = true
+          UpdateStatus()
+          if after then after() end
+        end
+      end)
+    end
+    page()
+  end
+
+  local function fetchSettings()
+    httpGet("/settings", function(obj)
+      if isTable(obj) and type(obj.dali_ip_interface) == "boolean" then
+        ipInterface = obj.dali_ip_interface
+        UpdateStatus()
+      end
+    end)
+  end
+
+  local function fetchInfo()
+    httpGet("/ota_status", function(obj)
+      if isTable(obj) then
+        Controls.Firmware.String = tostring(obj.version_string or "")
+      end
+    end)
+  end
+
+  function FullRefresh()
+    fetchInfo()
+    fetchSettings()
+    loadNvm(queryAll)
+  end
+
+  ---------------------------------------------------------------------------
+  -- DALI IP Interface socket
+  ---------------------------------------------------------------------------
+  local reconnectTimer, greetTimer, inputReconnectTimer = Timer.New(), Timer.New(), Timer.New()
+
+  local function setBusScan(active)
+    busScanUntil = active and (now() + QUIESCENT_TIMEOUT_S) or 0
+    if busScan ~= active then busScan = active; UpdateStatus() end
+  end
+
+  local BUTTON_EVENTS = { [0] = "released", [1] = "pressed", [2] = "short", [5] = "double", [9] = "long start",
+    [11] = "long repeat", [12] = "long stop" }
+
+  local function describeEvent(d)
+    local b0, b1, b2 = d[1], d[2], d[3]
+    if b0 & 0x01 == 1 then return nil end -- 24-bit command, not an event
+    local info = ((b1 & 0x03) << 8) | b2
+    if b0 & 0x80 ~= 0 then return string.format("non-device event info=%d", info) end
+    local addr = (b0 >> 1) & 0x3F
+    local field = (b1 >> 2) & 0x1F
+    local scheme = (b1 & 0x80 ~= 0) and "instance" or "type"
+    return string.format("A%d %s%d %s", addr, scheme == "instance" and "I" or "T", field, BUTTON_EVENTS[info] or ("info=" .. info))
+  end
+
+  function HandleDaliText(raw)
+    if type(raw) ~= "string" or raw:sub(1, 1) ~= "{" then return end -- web UI's plain-text monitor
+    local ok, msg = pcall(rapidjson.decode, raw)
+    if not ok or not isTable(msg) then return end
+    local t = msg.type
+    if t ~= "info" and t ~= "daliMonitor" and t ~= "daliFrame" and t ~= "daliAnswer" then return end
+    if not greeted then
+      greeted = true
+      silentFirmware = false
+      greetTimer:Stop()
+      dbg("greeted")
+      UpdateStatus()
+      FullRefresh() -- re-read names and levels on every (re)connect
+    end
+    if t ~= "daliMonitor" or not isTable(msg.data) then return end
+    if ipInterface ~= true then ipInterface = true end
+    echoPendingSince = nil
+    backoff = RECONNECT_MIN
+    if streamLost then streamLost = false end
+    local d = msg.data
+    if not isTable(d.data) or #d.data == 0 or d.framingError == true then UpdateStatus() return end
+    local data = {}
+    for i, b in ipairs(d.data) do data[i] = math.floor(b) & 0xFF end
+    local bits = isInt(d.bits) and math.floor(d.bits) or #data * 8
+    if bits == 24 and #data >= 3 then
+      if data[1] == 0xFF and data[2] == 0xFE and (data[3] == 0x1D or data[3] == 0x1E) then
+        setBusScan(data[3] == 0x1D)
+      elseif d.externalSource == true then
+        local ev = describeEvent(data)
+        if ev then Controls.LastBusEvent.String = ev end
+      end
+    end
+    local upd = applyAndRefresh(data, bits)
+    scheduleQueries(upd.query)
+    UpdateStatus()
+  end
+
+  local function dropDali()
+    greeted = false
+    echoPendingSince = nil
+    greetTimer:Stop()
+    local s = DaliSocket
+    DaliSocket = nil
+    wsGen = wsGen + 1
+    if s then pcall(function() s:Close() end) end
+  end
+
+  local function scheduleReconnect()
+    reconnectTimer:Stop()
+    reconnectTimer:Start(backoff)
+    backoff = math.min(RECONNECT_MAX, backoff * 2)
+  end
+
+  function ConnectDali()
+    reconnectTimer:Stop()
+    dropDali()
+    UpdateStatus()
+    if ip() == "" then return end
+    local gen = wsGen
+    local s = WebSocket.New()
+    DaliSocket = s
+    s.Connected = function()
+      if gen ~= wsGen then return end
+      dbg("DALI IP socket connected")
+      greetTimer:Start(GREETING_TIMEOUT_S)
+    end
+    s.Data = function(_, data) if gen == wsGen then HandleDaliText(data) end end
+    local function lost(why)
+      if gen ~= wsGen then return end
+      dbg("DALI IP socket", why)
+      dropDali()
+      UpdateStatus()
+      scheduleReconnect()
+    end
+    s.Error = function(_, err) lost("error " .. tostring(err)) end
+    s.Closed = function() lost("closed") end
+    s:Connect("ws", ip(), "/", 80)
+  end
+
+  greetTimer.EventHandler = function()
+    greetTimer:Stop()
+    if not greeted and DaliSocket then
+      silentFirmware = true
+      UpdateStatus()
+      FullRefresh() -- still load names and levels: control works over HTTP
+    end
+  end
+  reconnectTimer.EventHandler = function() reconnectTimer:Stop(); ConnectDali() end
+
+  ---------------------------------------------------------------------------
+  -- Built-in inputs (web UI socket ws://<ip>/ws, lease held with POST /cmd/input_monitor_start)
+  ---------------------------------------------------------------------------
+  local leaseTimer = Timer.New()
+  local inputBackoff = RECONNECT_MIN
+
+  function HandleInputText(raw)
+    if type(raw) ~= "string" then return end
+    local pin, level = raw:match("^IN:(%d+),([01])$")
+    pin = tonumber(pin)
+    if pin and pin < INPUT_COUNT then
+      Controls["Input" .. (pin + 1)].Boolean = (level == "1")
+    end
+  end
+
+  local function renewLease()
+    httpPost("/cmd/input_monitor_start", function(code)
+      local blocked = (code == 401)
+      if blocked ~= inputsBlocked then inputsBlocked = blocked; UpdateStatus() end
+    end)
+  end
+  leaseTimer.EventHandler = renewLease
+
+  function ConnectInputs()
+    inputReconnectTimer:Stop()
+    leaseTimer:Stop()
+    local old = InputSocket
+    InputSocket = nil
+    inGen = inGen + 1
+    if old then pcall(function() old:Close() end) end
+    if not INPUTS or ip() == "" then return end
+    local gen = inGen
+    local s = WebSocket.New()
+    InputSocket = s
+    s.Connected = function()
+      if gen ~= inGen then return end
+      inputBackoff = RECONNECT_MIN
+      renewLease()
+      leaseTimer:Start(LEASE_S)
+    end
+    s.Data = function(_, data) if gen == inGen then HandleInputText(data) end end
+    local function lost()
+      if gen ~= inGen then return end
+      leaseTimer:Stop()
+      InputSocket = nil
+      inGen = inGen + 1
+      inputReconnectTimer:Start(inputBackoff)
+      inputBackoff = math.min(RECONNECT_MAX, inputBackoff * 2)
+    end
+    s.Error = lost
+    s.Closed = lost
+    s:Connect("ws", ip(), "/ws", 80)
+  end
+  inputReconnectTimer.EventHandler = function() inputReconnectTimer:Stop(); ConnectInputs() end
+
+  ---------------------------------------------------------------------------
+  -- Watchdog: dead stream, bus-scan expiry, polling without live feedback
+  ---------------------------------------------------------------------------
+  local watchdog = Timer.New()
+  local lastPoll = 0
+  watchdog.EventHandler = function()
+    if busScan and now() >= busScanUntil then setBusScan(false) end
+    if echoPendingSince and ipInterface == true and DaliSocket and now() - echoPendingSince >= ECHO_TIMEOUT_S then
+      echoPendingSince = nil
+      streamLost = true
+      UpdateStatus()
+      dropDali()
+      scheduleReconnect()
+    end
+    if ip() ~= "" and not streamLive() and now() - lastPoll >= POLL_S then
+      lastPoll = now()
+      if ipInterface ~= true then fetchSettings() end
+      if modelLoaded then queryAll() else FullRefresh() end
+    end
+  end
+  watchdog:Start(5)
+
+  ---------------------------------------------------------------------------
+  -- Controls
+  ---------------------------------------------------------------------------
+  local throttles = {}
+  local function throttled(i, send)
+    local t = throttles[i]
+    if not t then
+      t = { timer = Timer.New(), release = Timer.New(), busy = false }
+      t.timer.EventHandler = function()
+        t.timer:Stop()
+        if t.pending then local f = t.pending; t.pending = nil; f(); t.timer:Start(0.2) else t.busy = false end
+      end
+      t.release.EventHandler = function() t.release:Stop(); levelHold[i] = nil; RefreshRows() end
+      throttles[i] = t
+    end
+    levelHold[i] = true
+    t.release:Stop(); t.release:Start(2)
+    if t.busy then t.pending = send else t.busy = true; send(); t.timer:Start(0.2) end
+  end
+
+  local function withGroup(i, fn)
+    local g = groupNumber(i)
+    if g == nil then
+      Controls.Status.Value = 1
+      Controls.Status.String = "Group row " .. i .. " has no DALI group number (0-15)"
+      return
+    end
+    fn(g)
+  end
+
+  for i = 1, ROWS do
+    local p = "Group" .. i
+    if Controls[p .. "Address"].String == "" then Controls[p .. "Address"].String = tostring(i - 1) end
+    Controls[p .. "Address"].EventHandler = function() RefreshRows() end
+
+    Controls[p .. "On"].EventHandler = function(c)
+      withGroup(i, function(g) sendGroup(g, c.Boolean and OP.GOTO_LAST_ACTIVE or OP.OFF) end)
+    end
+
+    Controls[p .. "Level"].EventHandler = function(c)
+      Controls[p .. "On"].Boolean = c.Value > 0
+      withGroup(i, function(g)
+        throttled(i, function()
+          local v = pctToDali(Controls[p .. "Level"].Value)
+          if v == 0 then sendGroup(g, OP.OFF)
+          else SendFrame({ data = { groupByte(g, false), v }, bits = 16 }) end
+        end)
+      end)
+    end
+
+    -- Raise / Lower: DALI UP / DOWN (a 200 ms fade at the gear's fade rate) repeated while held.
+    local ramp = Timer.New()
+    local dir = 0
+    ramp.EventHandler = function()
+      withGroup(i, function(g) sendGroup(g, dir > 0 and OP.UP or OP.DOWN) end)
+    end
+    local function rampButton(c, d)
+      if c.Boolean then
+        dir = d
+        withGroup(i, function(g)
+          -- UP does not switch on a fitting that is off; ON AND STEP UP does.
+          if d > 0 and not Controls[p .. "On"].Boolean then sendGroup(g, OP.ON_AND_STEP_UP) end
+          sendGroup(g, d > 0 and OP.UP or OP.DOWN)
+        end)
+        ramp:Start(RAMP_S)
+      else
+        ramp:Stop()
+      end
+    end
+    Controls[p .. "Raise"].EventHandler = function(c) rampButton(c, 1) end
+    Controls[p .. "Lower"].EventHandler = function(c) rampButton(c, -1) end
+
+    Controls[p .. "Recall"].EventHandler = function()
+      local s = math.floor(Controls[p .. "Scene"].Value + 0.5)
+      if s < 0 or s > 15 then return end
+      withGroup(i, function(g) sendGroup(g, OP.GOTO_SCENE + s) end)
+    end
+
+    if TW then
+      -- DT8 colour temperature (IEC 62386-209): Tc in mireds via DTR0/DTR1, then ACTIVATE.
+      Controls[p .. "Kelvin"].EventHandler = function()
+        withGroup(i, function(g)
+          throttled(i, function()
+            local k = math.max(1000, Controls[p .. "Kelvin"].Value)
+            local mireds = math.floor(1000000 / k + 0.5)
+            SendFrame({ data = { SPECIAL_DTR0, mireds & 0xFF } })
+            SendFrame({ data = { SPECIAL_DTR1, (mireds >> 8) & 0xFF } })
+            SendFrame({ data = { SPECIAL_ENABLE_DT, 8 } })
+            SendFrame({ data = { groupByte(g, true), OP.DT8_SET_TC } })
+            SendFrame({ data = { SPECIAL_ENABLE_DT, 8 } })
+            SendFrame({ data = { groupByte(g, true), OP.DT8_ACTIVATE } })
+          end)
+        end)
+      end
+    end
+  end
+
+  Controls.AllOn.EventHandler = function() SendFrame({ data = { BROADCAST_CMD, OP.RECALL_MAX } }) end
+  Controls.AllOff.EventHandler = function() SendFrame({ data = { BROADCAST_CMD, OP.OFF } }) end
+  Controls.Refresh.EventHandler = function() FullRefresh() end
+  Controls.IPAddress.EventHandler = function()
+    backoff = RECONNECT_MIN
+    ConnectDali()
+    ConnectInputs()
+  end
+
+  RefreshRows()
+  UpdateStatus()
+  if ip() ~= "" then FullRefresh() end -- control works over HTTP even before the socket is up
+  ConnectDali()
+  ConnectInputs()
+end
