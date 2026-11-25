@@ -1,43 +1,71 @@
 # Meeting room pilot
 
-Goal: the meeting room wall switch controls the meeting room DALI lights through Q-SYS, with a UCI page. The frosting glass Shelly gets a UCI button too. If the Core goes down, the switch still works.
+Goal: the meeting room (boardroom) DALI lights, frosting glass and presence sensor are on the Q-SYS Core with a UCI page, running alongside Home Assistant until the pilot is signed off.
+
+## Site facts (checked 2026-11-25)
+
+| Device | IP | Notes |
+|---|---|---|
+| Q-SYS Core 510i `PARTISAN-QSYSC1` | 192.168.60.11 | Firmware **10.5.0**. Already running the design **"Partisan - MiniScreen Projector"** |
+| Atios SmartCore (DALI) | 192.168.60.14 | DALI-2 IoT WebSocket protocol 3.0, fw 3.2.64-beta. **No REST API.** One DALI line, 23 fittings, all DT6 D4i LED drivers (no DT8, no relays) |
+| Frosting glass, Shelly 1 Gen3 | 192.168.60.224 | Switch 0 "Frosting". Input = Button, relay mode = Momentary (the room's own button drives the glass directly) |
+| Presence Gen4 | 192.168.61.207 | Zone `presencezone:200` "Room" is the main zone. Illuminance reports dark / twilight / bright (no lux) |
+
+DALI groups on the bus (from the plugin's scan):
+
+| Group | Short addresses | Fittings |
+|---|---|---|
+| 2 | 0, 1, 2, 4, 7, 14, 15 | 7 |
+| 3 | 3, 6, 8, 9, 13, 17, 23 | 7 |
+| **4 (meeting room, to confirm)** | 26, 27, 28 | 3 |
+| 5 | 18, 19, 20, 21, 22, 24 | 6 |
+
+The meeting room has no Shelly wall switch, so `examples/meeting-room.lua` and the Shelly fallback script are **not** part of this pilot (see the end of this document).
 
 ## 0. Before you start
-- Give every Shelly and the DALI gateway a **DHCP reservation**. The plugins connect by IP.
-- In DALI Cockpit, put the meeting room fittings in a **DALI group** (e.g. group 0) and program the scenes you want (e.g. scene 1 = presentation, scene 2 = video call). Note one fitting's **gateway device id**, which is the `id` in `http://<gateway>/devices`.
-- Check the gateway API answers: `http://<gateway>/info` should return JSON with a `version`.
+- [ ] **Designer 10.5** on the PC that will deploy. Designer must match the Core's firmware (10.5). Do not deploy from 10.4 or older: Designer will offer to change the Core's firmware.
+- [ ] Give the SmartCore, the glass Shelly and the Presence sensor **DHCP reservations**. The plugins connect by IP.
+- [ ] Confirm group 4 is the meeting room. Running group 4 to 50% and back should change only the meeting room lights; it was tested this way on 2026-11-25.
+- [ ] Decide how to add the pilot to the Core. It is running "Partisan - MiniScreen Projector", and a deploy replaces whatever is running. **Add the pilot components to that design** (File > Load from Core, or the saved .qsys), save it as a new revision, and keep the previous file to roll back to.
 
-## 1. The wall-switch Shelly
-In the Shelly web UI, for the input wired to the meeting room light switch:
-- **Input type:** Button (for a momentary retractive switch) or Switch (for a latching switch)
-- **Input/output mode:** Detached, so the relay no longer follows the switch and Q-SYS decides
-- **Authentication:** off
+## 1. Install the plugins
+Copy `plugins/Shelly-Gen2.qplug` and `plugins/Lunatone-DALI2-IoT.qplug` to `Documents\QSC\Q-Sys Designer\Plugins` and restart Designer. They appear under **Plugins** in the Schematic Library.
 
-For a latching switch, Q-SYS gets the input's **State** instead of push events. Tell me if that's the case and I'll adapt the room script.
+## 2. Try it in Emulate first
+Designer's Emulate mode runs plugin Lua on the PC, so the plugins can talk to the real devices without touching the Core.
+1. In a new, empty design, add the three components from step 3.
+2. Press **F6** (Emulate) and check each plugin's Status goes green.
+3. Check the controls follow the devices, as in step 5.
 
-## 2. Q-SYS design
-1. Add **Shelly Gen2+ Device**, name it `Shelly Meeting Room Switch`, and set Switches/Inputs to match the model. Enter the IP.
-2. Add another **Shelly Gen2+ Device** for the frosting glass (Shelly 1 Gen3: Switches 1, Inputs 1, Power Metering off). Name it `Shelly Meeting Room Glass`.
-3. Add **Lunatone DALI-2 IoT Gateway**, name it `DALI Gateway`, and enter the IP. Set row 1's **DALI Group** to the meeting room group number.
-4. On all three components set **Script Access** to `Script`.
-5. Add a **Control Script** and paste in `examples/meeting-room.lua`. Edit the config block at the top if the names, input number or scene differ.
-6. Deploy. Each plugin's **Status** should go green within a few seconds.
+## 3. Components
+Add these to the design:
 
-## 3. UCI page
-Drag these straight from the plugins onto a UCI:
-- DALI `Group 1 ~ On`, `Group 1 ~ Level` (fader), and `Raise` / `Lower`
-- Scene buttons: for each scene, a button wired to a **Control Script** or **Snapshot** that sets `Group 1 ~ Scene` and pulses `Recall`. Or wire one button per scene to `Recall` with the scene number fixed.
-- Glass Shelly `Switch 1 ~ On` labelled "Privacy glass"
-- The plugins' `Online` LEDs on a hidden technician page
+| Component | Name | Properties | Setup |
+|---|---|---|---|
+| Lunatone DALI-2 IoT Gateway | `DALI Gateway` | Rows 1, Colour Control None | IP 192.168.60.14, row 1 **Address** = `G4` |
+| Shelly Gen2+ Device | `Shelly Meeting Room Glass` | Switches 1, Inputs 1, Lights 0, Covers 0, Power Metering off | IP 192.168.60.224 |
+| Shelly Gen2+ Device | `Meeting Room Presence` | Switches 0, Inputs 0, Power Metering off, Presence Zones 1, Illuminance on | IP 192.168.61.207 |
 
-## 4. Fallback script (optional but recommended)
-1. In the Shelly web UI, go to **Scripts → Create script**, paste `shelly-scripts/qsys-dali-fallback.js`, set `daliHost`, `daliGroup` and `probeDevice`, then save. Turn on **Run on startup** and start the script. Note its id (usually 1).
-2. In the Shelly plugin's **Fallback Heartbeat Path**, enter `/script/1/hb`.
-3. To test: disable the Control Script, or unplug the Core's LAN. After 30 s a short press on the switch should toggle the lights directly.
+Set **Script Access** to `Script` on all three if you plan to add room logic later.
+
+Deploy (F5) to the Core. Each Status should go green. The DALI gateway shows "Scanning DALI bus" for about 25 seconds after connecting, then **Fittings = 23**, and row 1 shows **3** fittings of type `3x DT6`.
+
+## 4. UCI page
+- DALI row 1: `Group 1 ~ On`, `Group 1 ~ Level` (fader), `Raise` / `Lower`, `Scene` + `Recall Scene` (if scenes are programmed for group 4)
+- Glass: `Switch 1 ~ On`, labelled "Privacy glass"
+- Presence: `Presence ~ Zone 1 Occupied` (LED) and `Presence ~ Illuminance`
+- Technician page: each plugin's `Online` LED and Status, and the DALI row's `Fault` LED and `Fault Detail`
 
 ## 5. Things to check on the real system
-- [ ] Short press toggles, hold dims, double press recalls the scene
-- [ ] Fader and UCI follow when the lights are changed elsewhere (DALI Cockpit, broadcast)
-- [ ] Unplug the Shelly: Status turns red within about 35 s, then recovers by itself on reconnect
-- [ ] Reboot the gateway: Status turns amber while polling, then green
-- [ ] Fallback works with the Core offline
+- [ ] UCI On / Off / fader / Raise / Lower change only the meeting room lights
+- [ ] Lights changed from Home Assistant or DALI Cockpit show on the UCI within about 5 s (the plugin polls; the gateway does not push changes made by other clients)
+- [ ] Glass: the UCI button toggles the glass, and pressing the room's own button updates the UCI immediately
+- [ ] Presence: Occupied turns on within a few seconds of someone entering, and off after they leave
+- [ ] Unplug the glass Shelly: Status turns red within about 35 s, then recovers by itself
+- [ ] Reboot the SmartCore: DALI Status turns red ("reconnecting"), then green after it rescans
+- [ ] Home Assistant and Q-SYS both controlling the lights doesn't cause problems (no fighting)
+
+## Rooms with a Shelly wall switch (not this room)
+`examples/meeting-room.lua` links a Shelly input to a DALI group: short press toggles, hold dims, double press recalls a scene. It expects the input set to **Button** and the relay **Detached**. For a latching switch (input type **Switch**), the Shelly sends input state changes instead of push events and the script needs adapting.
+
+`shelly-scripts/qsys-dali-fallback.js` needs a gateway with the DALI-2 IoT REST API. The SmartCore doesn't have one, so the fallback can't be used with it as it stands.
