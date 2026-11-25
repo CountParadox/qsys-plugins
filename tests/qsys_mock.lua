@@ -1,7 +1,8 @@
 -- Minimal mock of the Q-SYS Lua runtime, enough to load and exercise the plugins offline.
 -- Usage: local Q = dofile("tests/qsys_mock.lua"); Q.load("plugins/X.qplug", { ["Prop"] = value })
 
-local cjson = require("cjson")
+local hasCjson, cjson = pcall(require, "cjson")
+if not hasCjson then cjson = dofile("tests/json.lua") end
 
 local Q = { http = {}, sockets = {}, timers = {}, clock = 1000, printed = {} }
 
