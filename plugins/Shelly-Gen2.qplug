@@ -1,0 +1,489 @@
+-- Shelly Gen2+ plugin for Q-SYS
+-- Controls any Shelly Gen2, Gen3, Gen4 or Pro device over its local RPC API.
+--
+-- Transport: a persistent WebSocket to ws://<ip>/rpc. Shelly pushes NotifyStatus and
+-- NotifyEvent frames down that socket, so switch changes and button presses reach the
+-- Core immediately. If the socket is down, commands fall back to HTTP POST /rpc.
+-- Nothing has to be configured on the Shelly itself.
+--
+-- Requirements: Q-SYS Designer 9.8 or newer (Lua WebSocket), Shelly authentication OFF.
+
+PluginInfo = {
+  Name = "Shelly~Gen2+ Device",
+  Version = "0.1.0",
+  BuildVersion = "0.1.0.0",
+  Id = "856d8d71-9de9-440c-8409-975483df1332",
+  Author = "qsys-plugins",
+  Description = "Shelly Gen2/Gen3/Gen4/Pro relays, inputs, dimmers and covers over the local RPC WebSocket",
+}
+
+local MAX_SWITCH, MAX_INPUT, MAX_LIGHT, MAX_COVER = 4, 4, 4, 2
+
+function GetColor(props)
+  return { 0, 140, 200 }
+end
+
+function GetPrettyName(props)
+  return "Shelly Gen2+ Device\n" .. PluginInfo.Version
+end
+
+function GetProperties()
+  return {
+    { Name = "Switches", Type = "integer", Min = 0, Max = MAX_SWITCH, Value = 1 },
+    { Name = "Inputs", Type = "integer", Min = 0, Max = MAX_INPUT, Value = 1 },
+    { Name = "Lights (dimmer channels)", Type = "integer", Min = 0, Max = MAX_LIGHT, Value = 0 },
+    { Name = "Covers", Type = "integer", Min = 0, Max = MAX_COVER, Value = 0 },
+    { Name = "Power Metering", Type = "boolean", Value = true },
+    { Name = "Debug", Type = "boolean", Value = false },
+  }
+end
+
+local function counts(props)
+  return {
+    sw = props["Switches"].Value,
+    inp = props["Inputs"].Value,
+    light = props["Lights (dimmer channels)"].Value,
+    cover = props["Covers"].Value,
+    pm = props["Power Metering"].Value,
+  }
+end
+
+function GetControls(props)
+  local n = counts(props)
+  local c = {
+    { Name = "IPAddress", ControlType = "Text", UserPin = true, PinStyle = "Input", Count = 1 },
+    { Name = "HeartbeatPath", ControlType = "Text", UserPin = false, Count = 1 },
+    { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "Online", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "DeviceName", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 },
+    { Name = "Model", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
+    { Name = "Firmware", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
+    { Name = "Reconnect", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 },
+  }
+  local function add(t) c[#c + 1] = t end
+  for i = 1, n.sw do
+    add({ Name = "Switch" .. i .. "On", ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both", Count = 1 })
+    add({ Name = "Switch" .. i .. "Toggle", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 })
+    if n.pm then
+      add({ Name = "Switch" .. i .. "Power", ControlType = "Knob", ControlUnit = "Float", Min = 0, Max = 10000, UserPin = true, PinStyle = "Output", Count = 1 })
+      add({ Name = "Switch" .. i .. "Energy", ControlType = "Knob", ControlUnit = "Float", Min = 0, Max = 1000000, UserPin = true, PinStyle = "Output", Count = 1 })
+    end
+  end
+  for i = 1, n.inp do
+    add({ Name = "Input" .. i .. "State", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = "Input" .. i .. "Held", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = "Input" .. i .. "Push", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = "Input" .. i .. "DoublePush", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = "Input" .. i .. "TriplePush", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = "Input" .. i .. "LongPush", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Output", Count = 1 })
+  end
+  for i = 1, n.light do
+    add({ Name = "Light" .. i .. "On", ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both", Count = 1 })
+    add({ Name = "Light" .. i .. "Level", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, UserPin = true, PinStyle = "Both", Count = 1 })
+  end
+  for i = 1, n.cover do
+    add({ Name = "Cover" .. i .. "Open", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 })
+    add({ Name = "Cover" .. i .. "Stop", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 })
+    add({ Name = "Cover" .. i .. "Close", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 })
+    add({ Name = "Cover" .. i .. "Position", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, UserPin = true, PinStyle = "Both", Count = 1 })
+    add({ Name = "Cover" .. i .. "State", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 })
+  end
+  return c
+end
+
+function GetControlLayout(props)
+  local n = counts(props)
+  local layout, graphics = {}, {}
+  local W, ROW, LBL = 360, 22, 130
+  local y = 6
+
+  local function box(title, rows)
+    graphics[#graphics + 1] = { Type = "GroupBox", Text = title, Fill = { 230, 236, 242 }, StrokeWidth = 1,
+      Position = { 4, y }, Size = { W, 26 + rows * ROW } }
+    y = y + 24
+  end
+  local function label(text, x, w)
+    graphics[#graphics + 1] = { Type = "Text", Text = text, HTextAlign = "Right", FontSize = 11,
+      Position = { x or 10, y }, Size = { w or LBL - 14, ROW - 4 } }
+  end
+  local function ctl(name, pretty, x, w, style)
+    layout[name] = { PrettyName = pretty, Position = { x, y }, Size = { w, ROW - 4 }, Style = style }
+  end
+
+  box("Connection", 6)
+  label("IP Address"); ctl("IPAddress", "Setup~IP Address", LBL, 150, "Text"); ctl("Reconnect", "Setup~Reconnect", LBL + 160, 60, "Button")
+  layout["Reconnect"].Legend = "Reconnect"; y = y + ROW
+  label("Status"); ctl("Status", "Status", LBL, 220); y = y + ROW
+  label("Online"); ctl("Online", "Online", LBL, 18); y = y + ROW
+  label("Name"); ctl("DeviceName", "Info~Name", LBL, 220); y = y + ROW
+  label("Model / FW"); ctl("Model", "Info~Model", LBL, 108); ctl("Firmware", "Info~Firmware", LBL + 112, 108); y = y + ROW
+  label("Heartbeat path"); ctl("HeartbeatPath", "Setup~Fallback Heartbeat Path", LBL, 150, "Text"); y = y + ROW + 8
+
+  for i = 1, n.sw do
+    box("Switch " .. i, n.pm and 2 or 1)
+    label("On / Toggle"); ctl("Switch" .. i .. "On", "Switch " .. i .. "~On", LBL, 50, "Button")
+    ctl("Switch" .. i .. "Toggle", "Switch " .. i .. "~Toggle", LBL + 56, 50, "Button"); layout["Switch" .. i .. "Toggle"].Legend = "Toggle"
+    y = y + ROW
+    if n.pm then
+      label("Power W / kWh"); ctl("Switch" .. i .. "Power", "Switch " .. i .. "~Power (W)", LBL, 80, "Text")
+      ctl("Switch" .. i .. "Energy", "Switch " .. i .. "~Energy (kWh)", LBL + 86, 80, "Text"); y = y + ROW
+    end
+    y = y + 8
+  end
+  for i = 1, n.inp do
+    box("Input " .. i, 2)
+    label("State / Held"); ctl("Input" .. i .. "State", "Input " .. i .. "~State", LBL, 18); ctl("Input" .. i .. "Held", "Input " .. i .. "~Held", LBL + 30, 18)
+    y = y + ROW
+    label("Push 1x 2x 3x Long")
+    local x = LBL
+    for _, ev in ipairs({ "Push", "DoublePush", "TriplePush", "LongPush" }) do
+      ctl("Input" .. i .. ev, "Input " .. i .. "~" .. ev, x, 48, "Button"); x = x + 52
+    end
+    y = y + ROW + 8
+  end
+  for i = 1, n.light do
+    box("Light " .. i, 1)
+    label("On / Level"); ctl("Light" .. i .. "On", "Light " .. i .. "~On", LBL, 50, "Button")
+    ctl("Light" .. i .. "Level", "Light " .. i .. "~Level", LBL + 56, 160, "Fader"); y = y + ROW + 8
+  end
+  for i = 1, n.cover do
+    box("Cover " .. i, 2)
+    label("Open / Stop / Close")
+    local x = LBL
+    for _, ev in ipairs({ "Open", "Stop", "Close" }) do
+      ctl("Cover" .. i .. ev, "Cover " .. i .. "~" .. ev, x, 56, "Button"); layout["Cover" .. i .. ev].Legend = ev; x = x + 60
+    end
+    y = y + ROW
+    label("Position / State"); ctl("Cover" .. i .. "Position", "Cover " .. i .. "~Position", LBL, 110, "Fader")
+    ctl("Cover" .. i .. "State", "Cover " .. i .. "~State", LBL + 116, 100); y = y + ROW + 8
+  end
+  return layout, graphics
+end
+
+if Controls then
+  local rapidjson = require("rapidjson")
+
+  local n = counts(Properties)
+  local DEBUG = Properties["Debug"].Value
+  local RECONNECT_S, HEARTBEAT_S, STALE_S = 5, 10, 35
+  local SRC = "qsys-" .. string.format("%06x", math.random(0, 0xFFFFFF))
+
+  local function dbg(...) if DEBUG then print("[Shelly]", ...) end end
+
+  -- The WebSocket is kept global so the garbage collector never collects it mid-session.
+  ShellySocket = nil
+  local connected = false
+  local generation = 0 -- bumped on every (re)connect so stale callbacks are ignored
+  local nextId = 0
+  local pending = {}
+  local lastRx = 0
+  local reconnectTimer = Timer.New()
+  local heartbeatTimer = Timer.New()
+
+  local function ip() return (Controls.IPAddress.String or ""):match("^%s*(.-)%s*$") end
+  local function now() return os.time() end
+
+  local function setStatus(code, text)
+    Controls.Status.Value = code
+    Controls.Status.String = text or ""
+    Controls.Online.Boolean = (code == 0)
+  end
+
+  local function isTable(v) return type(v) == "table" end
+  local function num(v) if type(v) == "number" then return v end return nil end
+
+  ---------------------------------------------------------------------------
+  -- RPC
+  ---------------------------------------------------------------------------
+  local function httpRpc(method, params, cb)
+    local host = ip()
+    if host == "" then return end
+    HttpClient.Upload({
+      Url = "http://" .. host .. "/rpc",
+      Method = "POST",
+      Headers = { ["Content-Type"] = "application/json" },
+      Data = rapidjson.encode({ id = 0, src = SRC, method = method, params = params or {} }),
+      Timeout = 5,
+      EventHandler = function(_, code, data, err)
+        if code == 200 and data then
+          local ok, msg = pcall(rapidjson.decode, data)
+          if ok and isTable(msg) then
+            if cb then cb(msg.result, msg.error) end
+            return
+          end
+        end
+        dbg("HTTP RPC failed", method, code, err)
+        if cb then cb(nil, { code = code, message = err or "HTTP error" }) end
+      end,
+    })
+  end
+
+  -- Send an RPC call. Uses the WebSocket when connected, otherwise HTTP.
+  function Rpc(method, params, cb)
+    if connected and ShellySocket then
+      nextId = nextId + 1
+      local msg = { id = nextId, src = SRC, method = method }
+      if params then msg.params = params end
+      if cb then pending[nextId] = cb end
+      dbg("->", method)
+      ShellySocket:Write(rapidjson.encode(msg), false)
+    else
+      httpRpc(method, params, cb)
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- Status handling
+  ---------------------------------------------------------------------------
+  local function comp(key)
+    local kind, idx = key:match("^(%a+):(%d+)$")
+    if kind then return kind, tonumber(idx) + 1 end
+  end
+
+  local function ctlFor(name) return Controls[name] end
+
+  local function applySwitch(i, s)
+    if i > n.sw then return end
+    if type(s.output) == "boolean" then ctlFor("Switch" .. i .. "On").Boolean = s.output end
+    if n.pm then
+      if num(s.apower) then ctlFor("Switch" .. i .. "Power").Value = s.apower end
+      if isTable(s.aenergy) and num(s.aenergy.total) then
+        ctlFor("Switch" .. i .. "Energy").Value = s.aenergy.total / 1000
+      end
+    end
+  end
+
+  local function applyInput(i, s)
+    if i > n.inp then return end
+    if type(s.state) == "boolean" then ctlFor("Input" .. i .. "State").Boolean = s.state end
+  end
+
+  local levelHold = {} -- suppress feedback while the user is moving a fader
+
+  local function applyLight(i, s)
+    if i > n.light then return end
+    if type(s.output) == "boolean" then ctlFor("Light" .. i .. "On").Boolean = s.output end
+    if num(s.brightness) and not levelHold["Light" .. i] then ctlFor("Light" .. i .. "Level").Value = s.brightness end
+  end
+
+  local function applyCover(i, s)
+    if i > n.cover then return end
+    if type(s.state) == "string" then ctlFor("Cover" .. i .. "State").String = s.state end
+    if num(s.current_pos) and not levelHold["Cover" .. i] then ctlFor("Cover" .. i .. "Position").Value = s.current_pos end
+  end
+
+  function ApplyStatus(status)
+    if not isTable(status) then return end
+    for key, s in pairs(status) do
+      local kind, i = comp(key)
+      if kind and isTable(s) then
+        if kind == "switch" then applySwitch(i, s)
+        elseif kind == "input" then applyInput(i, s)
+        elseif kind == "light" then applyLight(i, s)
+        elseif kind == "cover" then applyCover(i, s)
+        end
+      end
+    end
+  end
+
+  local EVENT_CONTROL = {
+    single_push = "Push", double_push = "DoublePush", triple_push = "TriplePush", long_push = "LongPush",
+  }
+
+  function HandleEvents(events)
+    if not isTable(events) then return end
+    for _, ev in ipairs(events) do
+      if isTable(ev) and type(ev.component) == "string" then
+        local kind, i = comp(ev.component)
+        if kind == "input" and i <= n.inp then
+          dbg("event", ev.component, ev.event)
+          local suffix = EVENT_CONTROL[ev.event]
+          if suffix then
+            ctlFor("Input" .. i .. suffix):Trigger()
+          elseif ev.event == "btn_down" then
+            ctlFor("Input" .. i .. "Held").Boolean = true
+          elseif ev.event == "btn_up" then
+            ctlFor("Input" .. i .. "Held").Boolean = false
+          end
+        end
+      end
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- WebSocket connection
+  ---------------------------------------------------------------------------
+  local function refresh()
+    Rpc("Shelly.GetDeviceInfo", nil, function(r)
+      if isTable(r) then
+        Controls.DeviceName.String = (type(r.name) == "string" and r.name) or r.id or ""
+        Controls.Model.String = r.model or ""
+        Controls.Firmware.String = r.ver or r.fw_id or ""
+      end
+    end)
+    Rpc("Shelly.GetStatus", nil, function(r, err)
+      if isTable(r) then
+        ApplyStatus(r)
+        setStatus(0, "")
+      elseif err then
+        setStatus(2, "GetStatus: " .. tostring(err.message))
+      end
+    end)
+  end
+
+  local function scheduleReconnect()
+    reconnectTimer:Stop()
+    reconnectTimer:Start(RECONNECT_S)
+  end
+
+  local function dropConnection(reason)
+    if connected or ShellySocket then dbg("connection dropped:", reason) end
+    connected = false
+    pending = {}
+    heartbeatTimer:Stop()
+    local s = ShellySocket
+    ShellySocket = nil
+    generation = generation + 1
+    if s then pcall(function() s:Close() end) end
+  end
+
+  function Connect()
+    reconnectTimer:Stop()
+    dropConnection("reconnect")
+    local host = ip()
+    if host == "" then
+      setStatus(3, "Enter the Shelly IP address")
+      return
+    end
+    setStatus(5, "Connecting to " .. host)
+    local gen = generation
+    local s = WebSocket.New()
+    ShellySocket = s
+
+    s.Connected = function()
+      if gen ~= generation then return end
+      connected = true
+      lastRx = now()
+      dbg("connected", host)
+      heartbeatTimer:Start(HEARTBEAT_S)
+      refresh()
+    end
+    s.Data = function(_, data)
+      if gen ~= generation then return end
+      lastRx = now()
+      local ok, msg = pcall(rapidjson.decode, data)
+      if not ok or not isTable(msg) then return end
+      if msg.id ~= nil and pending[msg.id] then
+        local cb = pending[msg.id]
+        pending[msg.id] = nil
+        cb(msg.result, msg.error)
+      elseif msg.method == "NotifyStatus" or msg.method == "NotifyFullStatus" then
+        ApplyStatus(msg.params)
+      elseif msg.method == "NotifyEvent" and isTable(msg.params) then
+        HandleEvents(msg.params.events)
+      end
+    end
+    s.Error = function(_, err)
+      if gen ~= generation then return end
+      setStatus(4, "Connection error: " .. tostring(err))
+      dropConnection("error")
+      scheduleReconnect()
+    end
+    s.Closed = function()
+      if gen ~= generation then return end
+      setStatus(4, "Disconnected")
+      dropConnection("closed")
+      scheduleReconnect()
+    end
+    s:Connect("ws", host, "/rpc", 80)
+  end
+
+  reconnectTimer.EventHandler = function()
+    reconnectTimer:Stop()
+    Connect()
+  end
+
+  -- Heartbeat: poll status (also resyncs anything a lost frame missed), ping the
+  -- fallback script, and force a reconnect if the device has gone quiet.
+  heartbeatTimer.EventHandler = function()
+    if not connected then return end
+    if now() - lastRx > STALE_S then
+      setStatus(4, "No response from device")
+      dropConnection("stale")
+      scheduleReconnect()
+      return
+    end
+    Rpc("Shelly.GetStatus", nil, function(r) if isTable(r) then ApplyStatus(r); setStatus(0, "") end end)
+    local hb = (Controls.HeartbeatPath.String or ""):match("^%s*(.-)%s*$")
+    if hb ~= "" then
+      if hb:sub(1, 1) ~= "/" then hb = "/" .. hb end
+      HttpClient.Download({ Url = "http://" .. ip() .. hb, Timeout = 5, EventHandler = function() end })
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- Control handlers
+  ---------------------------------------------------------------------------
+  -- Throttle fader moves: send at most one command per 150 ms, always ending on the final value.
+  local throttles = {}
+  local function throttled(key, send)
+    local t = throttles[key]
+    if not t then
+      t = { timer = Timer.New(), busy = false, pending = nil, release = Timer.New() }
+      t.timer.EventHandler = function()
+        t.timer:Stop()
+        if t.pending then local f = t.pending; t.pending = nil; f(); t.timer:Start(0.15) else t.busy = false end
+      end
+      t.release.EventHandler = function() t.release:Stop(); levelHold[key] = nil end
+      throttles[key] = t
+    end
+    levelHold[key] = true
+    t.release:Stop(); t.release:Start(1.5)
+    if t.busy then t.pending = send else t.busy = true; send(); t.timer:Start(0.15) end
+  end
+
+  for i = 1, n.sw do
+    local id = i - 1
+    ctlFor("Switch" .. i .. "On").EventHandler = function(c)
+      Rpc("Switch.Set", { id = id, on = c.Boolean })
+    end
+    ctlFor("Switch" .. i .. "Toggle").EventHandler = function()
+      local c = ctlFor("Switch" .. i .. "On")
+      c.Boolean = not c.Boolean
+      Rpc("Switch.Set", { id = id, on = c.Boolean })
+    end
+  end
+
+  for i = 1, n.light do
+    local id = i - 1
+    ctlFor("Light" .. i .. "On").EventHandler = function(c)
+      Rpc("Light.Set", { id = id, on = c.Boolean })
+    end
+    ctlFor("Light" .. i .. "Level").EventHandler = function(c)
+      local v = math.floor(c.Value + 0.5)
+      ctlFor("Light" .. i .. "On").Boolean = v > 0
+      throttled("Light" .. i, function()
+        local lv = math.floor(ctlFor("Light" .. i .. "Level").Value + 0.5)
+        if lv <= 0 then Rpc("Light.Set", { id = id, on = false })
+        else Rpc("Light.Set", { id = id, on = true, brightness = lv }) end
+      end)
+    end
+  end
+
+  for i = 1, n.cover do
+    local id = i - 1
+    ctlFor("Cover" .. i .. "Open").EventHandler = function() Rpc("Cover.Open", { id = id }) end
+    ctlFor("Cover" .. i .. "Stop").EventHandler = function() Rpc("Cover.Stop", { id = id }) end
+    ctlFor("Cover" .. i .. "Close").EventHandler = function() Rpc("Cover.Close", { id = id }) end
+    ctlFor("Cover" .. i .. "Position").EventHandler = function()
+      throttled("Cover" .. i, function()
+        Rpc("Cover.GoToPosition", { id = id, pos = math.floor(ctlFor("Cover" .. i .. "Position").Value + 0.5) })
+      end)
+    end
+  end
+
+  Controls.IPAddress.EventHandler = function() Connect() end
+  Controls.Reconnect.EventHandler = function() Connect() end
+
+  Connect()
+end
