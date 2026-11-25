@@ -1,23 +1,37 @@
 -- Lunatone DALI-2 IoT gateway plugin for Q-SYS
--- Works with the Lunatone DALI-2 IoT / IoT4 gateway and devices that expose the same API
--- (e.g. a SmartCore running in DALI-2 IoT mode).
+-- Works with the Lunatone DALI-2 IoT / IoT4 gateway and devices that speak its WebSocket
+-- protocol, e.g. the Atios SmartCore (DALI IP interface, firmware 3.2.x).
 --
--- Commands: REST, POST /group/{n}/control and POST /broadcast/control with a ControlData body.
--- Feedback: the gateway WebSocket (ws://<ip>/) pushes "devices" events whenever a fitting changes.
--- Group state is derived from the fittings in that group: On if any fitting is on, Level = highest level.
--- If the WebSocket is down, the plugin polls GET /devices instead.
+-- Everything goes over the gateway WebSocket (ws://<ip>/) as raw DALI frames:
+--   send   {"type":"daliFrame","data":{"line":0,"numberOfBits":16,"mode":{...},"daliData":[a,b]}}
+--   reply  {"type":"daliFrame","data":{"result":0}}              (0 = sent OK)
+--   answer {"type":"daliAnswer","data":{"result":8,"daliData":v}} (8 = 8-bit answer, 0 = none)
+-- The SmartCore has no REST API (GET /devices, POST /group/{n}/control return 404), and the
+-- gateway only reports a client's own traffic, so changes made elsewhere (DALI Cockpit,
+-- Home Assistant) are picked up by polling the fittings.
 --
--- Do addressing, grouping and scene programming in DALI Cockpit or the gateway web UI.
--- This plugin only recalls groups and scenes.
+-- Device types:
+--   DT6 (LED)            level, scenes, failure status
+--   DT7 (relay/switching) on/off; any level above 0 switches on (default thresholds)
+--   DT8 (colour)         Tc colour temperature and RGB(W) levels, with read-back
+--   others               level and scenes (IEC 62386-102 commands work on all gear)
+--
+-- Each row targets a group ("4" or "G4"), one fitting ("A26") or everything ("BC").
+-- On connect the plugin scans short addresses 0-63 and reads each fitting's groups, device
+-- types and DT8 colour features. Row state is derived from its fittings: On if any is on,
+-- Level = the highest. Addressing, grouping and scenes are set up in DALI Cockpit or the
+-- gateway web UI; this plugin never changes gear configuration.
 
 PluginInfo = {
   Name = "Lunatone~DALI-2 IoT Gateway",
-  Version = "0.1.0",
-  BuildVersion = "0.1.0.0",
+  Version = "0.3.0",
+  BuildVersion = "0.3.0.0",
   Id = "c6c3e841-c15d-48ac-819f-670a8b422676",
   Author = "qsys-plugins",
-  Description = "DALI group and scene control through a Lunatone DALI-2 IoT gateway",
+  Description = "DALI DT6 / DT7 / DT8 control through a Lunatone DALI-2 IoT gateway",
 }
+
+local COLOUR_CHOICES = { "None", "Tunable White", "RGBW", "Tunable White + RGBW" }
 
 function GetColor(props)
   return { 240, 170, 0 }
@@ -29,16 +43,30 @@ end
 
 function GetProperties()
   return {
-    { Name = "Group Rows", Type = "integer", Min = 1, Max = 16, Value = 4 },
-    { Name = "Tunable White", Type = "boolean", Value = false },
+    { Name = "Rows", Type = "integer", Min = 1, Max = 32, Value = 4 },
+    { Name = "Colour Control", Type = "enum", Choices = COLOUR_CHOICES, Value = "None" },
+    { Name = "Kelvin Min", Type = "integer", Min = 1000, Max = 20000, Value = 2700 },
+    { Name = "Kelvin Max", Type = "integer", Min = 1000, Max = 20000, Value = 6500 },
     { Name = "Port", Type = "integer", Min = 1, Max = 65535, Value = 80 },
     { Name = "Debug", Type = "boolean", Value = false },
   }
 end
 
+local function opts(props)
+  local colour = props["Colour Control"].Value
+  return {
+    rows = props["Rows"].Value,
+    tw = colour == "Tunable White" or colour == "Tunable White + RGBW",
+    rgbw = colour == "RGBW" or colour == "Tunable White + RGBW",
+    kmin = props["Kelvin Min"].Value,
+    kmax = props["Kelvin Max"].Value,
+  }
+end
+
+local RGBW = { "Red", "Green", "Blue", "White" }
+
 function GetControls(props)
-  local rows = props["Group Rows"].Value
-  local tw = props["Tunable White"].Value
+  local o = opts(props)
   local c = {
     { Name = "IPAddress", ControlType = "Text", UserPin = true, PinStyle = "Input", Count = 1 },
     { Name = "Status", ControlType = "Indicator", IndicatorType = "Status", UserPin = true, PinStyle = "Output", Count = 1 },
@@ -46,31 +74,39 @@ function GetControls(props)
     { Name = "GatewayName", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
     { Name = "Firmware", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
     { Name = "DeviceCount", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
+    { Name = "BusTypes", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 },
     { Name = "AllOn", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 },
     { Name = "AllOff", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 },
     { Name = "Refresh", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 },
   }
   local function add(t) c[#c + 1] = t end
-  for i = 1, rows do
+  for i = 1, o.rows do
     local p = "Group" .. i
     add({ Name = p .. "Address", ControlType = "Text", UserPin = false, Count = 1 })
     add({ Name = p .. "Members", ControlType = "Indicator", IndicatorType = "Text", UserPin = false, Count = 1 })
+    add({ Name = p .. "Types", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = p .. "Fault", ControlType = "Indicator", IndicatorType = "Led", UserPin = true, PinStyle = "Output", Count = 1 })
+    add({ Name = p .. "FaultText", ControlType = "Indicator", IndicatorType = "Text", UserPin = true, PinStyle = "Output", Count = 1 })
     add({ Name = p .. "On", ControlType = "Button", ButtonType = "Toggle", UserPin = true, PinStyle = "Both", Count = 1 })
     add({ Name = p .. "Level", ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, UserPin = true, PinStyle = "Both", Count = 1 })
     add({ Name = p .. "Raise", ControlType = "Button", ButtonType = "Momentary", UserPin = true, PinStyle = "Input", Count = 1 })
     add({ Name = p .. "Lower", ControlType = "Button", ButtonType = "Momentary", UserPin = true, PinStyle = "Input", Count = 1 })
     add({ Name = p .. "Scene", ControlType = "Knob", ControlUnit = "Integer", Min = 0, Max = 15, UserPin = true, PinStyle = "Input", Count = 1 })
     add({ Name = p .. "Recall", ControlType = "Button", ButtonType = "Trigger", UserPin = true, PinStyle = "Input", Count = 1 })
-    if tw then
-      add({ Name = p .. "Kelvin", ControlType = "Knob", ControlUnit = "Integer", Min = 2700, Max = 6500, UserPin = true, PinStyle = "Both", Count = 1 })
+    if o.tw then
+      add({ Name = p .. "Kelvin", ControlType = "Knob", ControlUnit = "Integer", Min = o.kmin, Max = o.kmax, UserPin = true, PinStyle = "Both", Count = 1 })
+    end
+    if o.rgbw then
+      for _, ch in ipairs(RGBW) do
+        add({ Name = p .. ch, ControlType = "Knob", ControlUnit = "Percent", Min = 0, Max = 100, UserPin = true, PinStyle = "Both", Count = 1 })
+      end
     end
   end
   return c
 end
 
 function GetControlLayout(props)
-  local rows = props["Group Rows"].Value
-  local tw = props["Tunable White"].Value
+  local o = opts(props)
   local layout, graphics = {}, {}
   local ROW = 22
   local y = 6
@@ -82,36 +118,46 @@ function GetControlLayout(props)
     layout[name] = { PrettyName = pretty, Position = { x, y }, Size = { w, ROW - 4 }, Style = style, Legend = legend }
   end
 
-  local width = tw and 640 or 570
+  local width = 726 + (o.tw and 126 or 0) + (o.rgbw and 4 * 64 or 0)
   graphics[#graphics + 1] = { Type = "GroupBox", Text = "Gateway", Fill = { 242, 236, 224 }, StrokeWidth = 1,
     Position = { 4, y }, Size = { width, 26 + 4 * ROW } }
   y = y + 24
   text("IP Address", 10, 110, "Right"); ctl("IPAddress", "Setup~IP Address", 126, 150, "Text")
-  ctl("Refresh", "Setup~Refresh", 284, 70, "Button", "Refresh"); y = y + ROW
+  ctl("Refresh", "Setup~Rescan", 284, 70, "Button", "Rescan"); y = y + ROW
   text("Status", 10, 110, "Right"); ctl("Status", "Status", 126, 228); ctl("Online", "Online", 362, 18); y = y + ROW
   text("Name / FW", 10, 110, "Right"); ctl("GatewayName", "Info~Name", 126, 110); ctl("Firmware", "Info~Firmware", 244, 110)
-  ctl("DeviceCount", "Info~Fittings", 362, 70); y = y + ROW
+  ctl("DeviceCount", "Info~Fittings", 362, 50); ctl("BusTypes", "Info~Device Types", 418, 300); y = y + ROW
   text("Broadcast", 10, 110, "Right"); ctl("AllOn", "Broadcast~All On", 126, 70, "Button", "All On")
   ctl("AllOff", "Broadcast~All Off", 202, 70, "Button", "All Off"); y = y + ROW + 10
 
-  graphics[#graphics + 1] = { Type = "GroupBox", Text = "Groups", Fill = { 242, 236, 224 }, StrokeWidth = 1,
-    Position = { 4, y }, Size = { width, 46 + rows * ROW } }
+  graphics[#graphics + 1] = { Type = "GroupBox", Text = "Rows", Fill = { 242, 236, 224 }, StrokeWidth = 1,
+    Position = { 4, y }, Size = { width, 46 + o.rows * ROW } }
   y = y + 24
-  text("Row", 8, 30); text("DALI grp", 40, 56); text("Fittings", 100, 56); text("On", 160, 40); text("Level", 204, 150)
-  text("- / +", 358, 56); text("Scene", 418, 90); if tw then text("Kelvin", 512, 120) end
+  text("Row", 8, 30); text("Address", 40, 56); text("Fittings", 100, 50); text("Types", 152, 120); text("Fault", 276, 120)
+  text("On", 400, 40); text("Level", 444, 150); text("- / +", 598, 56); text("Scene", 658, 70)
+  local x0 = 732
+  if o.tw then text("Kelvin", x0, 120); x0 = x0 + 126 end
+  if o.rgbw then for k, ch in ipairs(RGBW) do text(ch:sub(1, 1), x0 + (k - 1) * 64, 60) end end
   y = y + ROW
-  for i = 1, rows do
-    local p, pn = "Group" .. i, "Group " .. i .. "~"
+  for i = 1, o.rows do
+    local p, pn = "Group" .. i, "Row " .. i .. "~"
     text(tostring(i), 8, 30)
-    ctl(p .. "Address", pn .. "DALI Group (0-15)", 46, 44, "Text")
-    ctl(p .. "Members", pn .. "Fittings", 100, 56)
-    ctl(p .. "On", pn .. "On", 160, 40, "Button")
-    ctl(p .. "Level", pn .. "Level", 204, 150, "Fader")
-    ctl(p .. "Lower", pn .. "Lower", 358, 26, "Button", "-")
-    ctl(p .. "Raise", pn .. "Raise", 388, 26, "Button", "+")
-    ctl(p .. "Scene", pn .. "Scene", 418, 40, "Text")
-    ctl(p .. "Recall", pn .. "Recall Scene", 462, 46, "Button", "Recall")
-    if tw then ctl(p .. "Kelvin", pn .. "Colour Temp (K)", 512, 120, "Fader") end
+    ctl(p .. "Address", pn .. "Address (G0-15, A0-63, BC)", 44, 50, "Text")
+    ctl(p .. "Members", pn .. "Fittings", 100, 50)
+    ctl(p .. "Types", pn .. "Device Types", 152, 120)
+    ctl(p .. "Fault", pn .. "Fault", 276, 18)
+    ctl(p .. "FaultText", pn .. "Fault Detail", 298, 98)
+    ctl(p .. "On", pn .. "On", 400, 40, "Button")
+    ctl(p .. "Level", pn .. "Level", 444, 150, "Fader")
+    ctl(p .. "Lower", pn .. "Lower", 598, 26, "Button", "-")
+    ctl(p .. "Raise", pn .. "Raise", 628, 26, "Button", "+")
+    ctl(p .. "Scene", pn .. "Scene", 658, 30, "Text")
+    ctl(p .. "Recall", pn .. "Recall Scene", 690, 38, "Button", "Go")
+    local x = 732
+    if o.tw then ctl(p .. "Kelvin", pn .. "Colour Temp (K)", x, 120, "Fader"); x = x + 126 end
+    if o.rgbw then
+      for k, ch in ipairs(RGBW) do ctl(p .. ch, pn .. ch, x + (k - 1) * 64, 60, "Fader") end
+    end
     y = y + ROW
   end
   return layout, graphics
@@ -120,26 +166,83 @@ end
 if Controls then
   local rapidjson = require("rapidjson")
 
-  local ROWS = Properties["Group Rows"].Value
-  local TW = Properties["Tunable White"].Value
+  local O = opts(Properties)
+  local ROWS = O.rows
   local PORT = Properties["Port"].Value
   local DEBUG = Properties["Debug"].Value
-  local RECONNECT_S, POLL_S, RAMP_S, RAMP_STEP = 5, 10, 0.25, 4
+  local RECONNECT_S, POLL_S, PING_S, RESCAN_S = 5, 5, 10, 900
+  local STATUS_EVERY, COLOUR_EVERY = 12, 6 -- in poll cycles: failure status every 60 s, colour every 30 s
+  local RAMP_S, RAMP_STEP = 0.25, 4
+  local FRAME_TIMEOUT_S = 1.0
+  local FADE_S = 2.5 -- re-read levels this long after a command, once fades have finished
+  local MISSING_AFTER = 3 -- unanswered level reads before a fitting counts as missing
+
+  -- IEC 62386-102 (all gear)
+  local CMD_OFF, CMD_GOTO_SCENE = 0x00, 0x10
+  local Q_STATUS, Q_CONTENT_DTR0, Q_DEVICE_TYPE, Q_ACTUAL_LEVEL, Q_NEXT_DEVICE_TYPE = 0x90, 0x98, 0x99, 0xA0, 0xA7
+  local Q_GROUPS_0_7, Q_GROUPS_8_15 = 0xC0, 0xC1
+  -- special commands (first byte)
+  local DTR0, DTR1, DTR2, ENABLE_DT = 0xA3, 0xC3, 0xC5, 0xC1
+  -- IEC 62386-209 (DT8 colour)
+  local DT8_ACTIVATE, DT8_SET_TC, DT8_SET_RGB, DT8_SET_WAF = 0xE2, 0xE7, 0xEB, 0xEC
+  local DT8_Q_FEATURES, DT8_Q_COLOUR_VALUE = 0xF9, 0xFA
+  local CV_TC, CV_RED, CV_GREEN, CV_BLUE, CV_WHITE = 2, 9, 10, 11, 12
+  local ANSWER_8BIT, MASK = 8, 255
 
   local function dbg(...) if DEBUG then print("[DALI]", ...) end end
   local function isTable(v) return type(v) == "table" end
   local function ip() return (Controls.IPAddress.String or ""):match("^%s*(.-)%s*$") end
-  local function base()
-    local h = ip()
-    if PORT ~= 80 then h = h .. ":" .. PORT end
-    return "http://" .. h
+  local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi end return v end
+
+  ---------------------------------------------------------------------------
+  -- Level conversion: DALI arc power (0-254) <-> percent, standard logarithmic curve
+  ---------------------------------------------------------------------------
+  function PercentToArc(p)
+    if p <= 0 then return 0 end
+    if p >= 100 then return 254 end
+    local arc = math.floor(253 / 3 * (math.log(p, 10) + 1) + 1 + 0.5)
+    if arc < 1 then arc = 1 end
+    return arc
   end
+
+  function ArcToPercent(arc)
+    if arc <= 0 then return 0 end
+    if arc >= 254 then return 100 end
+    local p = 10 ^ ((arc - 1) * 3 / 253 - 1)
+    if p < 10 then return math.floor(p * 10 + 0.5) / 10 end
+    return math.floor(p + 0.5)
+  end
+
+  ---------------------------------------------------------------------------
+  -- Row addressing: "4" / "G4" = group 4, "A26" = short address 26, "BC" = broadcast
+  ---------------------------------------------------------------------------
+  function ParseAddress(s)
+    s = (s or ""):upper():gsub("%s", "")
+    if s == "BC" or s == "ALL" or s == "BROADCAST" then return { kind = "bc" } end
+    local g = s:match("^G?(%d+)$")
+    if g and tonumber(g) <= 15 then return { kind = "group", n = tonumber(g) } end
+    local a = s:match("^[AS](%d+)$")
+    if a and tonumber(a) <= 63 then return { kind = "short", n = tonumber(a) } end
+    return nil
+  end
+
+  local function addrByte(t, isCmd)
+    local c = isCmd and 1 or 0
+    if t.kind == "bc" then return 0xFE | c end
+    if t.kind == "group" then return 0x80 | (t.n << 1) | c end
+    return (t.n << 1) | c
+  end
+  local function shortCmd(a) return (a << 1) | 1 end
 
   DaliSocket = nil -- global: keep the socket alive for the garbage collector
   local wsUp = false
   local generation = 0
-  local devices = {} -- id -> device table (merged from REST + WebSocket)
-  local reconnectTimer, pollTimer = Timer.New(), Timer.New()
+  -- short address -> { groups = {g=true}, types = {6,...}, arc, colour = {features, tc, ...},
+  --                    misses, status }
+  local devices = {}
+  local scanned = false
+  local reconnectTimer, pollTimer, frameTimer = Timer.New(), Timer.New(), Timer.New()
+  local lastRescan = 0
 
   local function setStatus(code, text)
     Controls.Status.Value = code
@@ -147,143 +250,370 @@ if Controls then
     Controls.Online.Boolean = (code == 0)
   end
 
-  local function groupNumber(i)
-    local v = tonumber(Controls["Group" .. i .. "Address"].String)
-    if v and v >= 0 and v <= 15 then return math.floor(v) end
-    return nil
+  local function rowTarget(i) return ParseAddress(Controls["Group" .. i .. "Address"].String) end
+
+  local function inTarget(t, a, d)
+    if t.kind == "bc" then return true end
+    if t.kind == "group" then return d.groups[t.n] == true end
+    return a == t.n
+  end
+
+  local function members(t)
+    local list = {}
+    if t then for a, d in pairs(devices) do if inTarget(t, a, d) then list[#list + 1] = a end end end
+    table.sort(list)
+    return list
+  end
+
+  local function hasType(d, dt)
+    for _, x in ipairs(d.types or {}) do if x == dt then return true end end
+    return false
   end
 
   ---------------------------------------------------------------------------
-  -- REST
+  -- Frame queue. One frame on the bus at a time. An entry is a list of frames sent back to
+  -- back (DTR writes + ENABLE DEVICE TYPE + command must not be split); commands go before
+  -- polling queries.
   ---------------------------------------------------------------------------
-  local function post(path, body, cb)
-    if ip() == "" then return end
-    dbg("POST", path, rapidjson.encode(body))
-    HttpClient.Upload({
-      Url = base() .. path,
-      Method = "POST",
-      Headers = { ["Content-Type"] = "application/json" },
-      Data = rapidjson.encode(body),
-      Timeout = 5,
-      EventHandler = function(_, code, data, err)
-        if code < 200 or code >= 300 then
-          dbg("POST failed", path, code, err, data)
-          setStatus(1, "Command failed (" .. tostring(code) .. ") " .. path)
-        end
-        if cb then cb(code, data) end
-      end,
-    })
+  local cmdQueue, queryQueue = {}, {}
+  local inFlight = nil -- { frames = {{a,b,answer}}, idx, answers, cb, key }
+
+  local sendNext
+
+  local function sendFrame(e)
+    local f = e.frames[e.idx]
+    local msg = { type = "daliFrame", data = { line = 0, numberOfBits = 16,
+      mode = { sendTwice = false, waitForAnswer = f[3] == true }, daliData = { f[1], f[2] } } }
+    DaliSocket:Write(rapidjson.encode(msg), false)
+    frameTimer:Start(FRAME_TIMEOUT_S)
   end
 
-  local function get(path, cb)
-    if ip() == "" then return end
-    HttpClient.Download({
-      Url = base() .. path,
-      Timeout = 5,
-      EventHandler = function(_, code, data, err)
-        if code == 200 and data then
-          local ok, obj = pcall(rapidjson.decode, data)
-          if ok then cb(obj) return end
-        end
-        dbg("GET failed", path, code, err)
-        cb(nil, code, err)
-      end,
-    })
+  local function finishEntry(ok)
+    local e = inFlight
+    inFlight = nil
+    frameTimer:Stop()
+    if e and e.cb then e.cb(e.answers, ok) end
+    sendNext()
+  end
+
+  -- The current frame is done (answer may be nil). Move to the next frame of the entry,
+  -- unless the entry's stopIf(idx, answer) says the sequence is complete.
+  local function frameDone(answer)
+    local e = inFlight
+    if not e then return end
+    frameTimer:Stop()
+    e.answers[e.idx] = answer
+    if e.stopIf and e.stopIf(e.idx, answer) then finishEntry(true) return end
+    e.idx = e.idx + 1
+    if e.idx > #e.frames then finishEntry(true) else sendFrame(e) end
+  end
+
+  function sendNext()
+    if inFlight or not (wsUp and DaliSocket) then return end
+    local e = table.remove(cmdQueue, 1) or table.remove(queryQueue, 1)
+    if not e then return end
+    e.idx, e.answers = 1, {}
+    inFlight = e
+    sendFrame(e)
+  end
+
+  frameTimer.EventHandler = function()
+    frameTimer:Stop()
+    local e = inFlight
+    if not e then return end
+    local f = e.frames[e.idx]
+    dbg("frame timeout", f[1], f[2])
+    if f[3] then frameDone(nil) else finishEntry(false) end -- a lost command aborts its sequence
+  end
+
+  -- Queue forward frames ({a,b} pairs) as one command. key replaces a still-queued command
+  -- with the same key, so a fast fader never builds a backlog.
+  local function command(frames, key)
+    if key then
+      for _, e in ipairs(cmdQueue) do
+        if e.key == key then e.frames = frames; return end
+      end
+    end
+    cmdQueue[#cmdQueue + 1] = { frames = frames, key = key }
+    sendNext()
+  end
+
+  -- Queue a query sequence. Frames marked with a third element true expect an answer.
+  -- cb(answers) gets the answers indexed by frame. Same key = same question: share the answer.
+  local function query(frames, key, cb, stopIf)
+    for _, e in ipairs(queryQueue) do
+      if e.key == key then
+        local prev = e.cb
+        e.cb = function(ans, ok) prev(ans, ok); cb(ans, ok) end
+        return
+      end
+    end
+    queryQueue[#queryQueue + 1] = { frames = frames, key = key, cb = cb, stopIf = stopIf }
+    sendNext()
+  end
+
+  local function ask(a, cmd, cb)
+    query({ { shortCmd(a), cmd, true } }, a .. ":" .. cmd, function(ans) cb(ans[1]) end)
+  end
+
+  -- DT8 QUERY COLOUR VALUE: 16-bit answer (MSB answered, LSB left in DTR0), or nil.
+  local function askColour16(a, selector, cb)
+    query({ { DTR0, selector }, { ENABLE_DT, 8 }, { shortCmd(a), DT8_Q_COLOUR_VALUE, true },
+            { shortCmd(a), Q_CONTENT_DTR0, true } },
+      a .. ":cv" .. selector, function(ans)
+        local msb, lsb = ans[3], ans[4]
+        if msb == nil or lsb == nil or (msb == MASK and lsb == MASK) then cb(nil) else cb(msb * 256 + lsb) end
+      end)
+  end
+
+  -- DT8 QUERY COLOUR VALUE for an 8-bit value (RGBWAF dim levels).
+  local function askColour8(a, selector, cb)
+    query({ { DTR0, selector }, { ENABLE_DT, 8 }, { shortCmd(a), DT8_Q_COLOUR_VALUE, true } },
+      a .. ":cv" .. selector, function(ans)
+        local v = ans[3]
+        if v == nil or v == MASK then cb(nil) else cb(v) end
+      end)
   end
 
   ---------------------------------------------------------------------------
   -- State
   ---------------------------------------------------------------------------
-  local levelHold = {} -- rows whose fader is being moved; ignore feedback for a moment
+  local levelHold, colourHold = {}, {} -- rows whose faders are being moved: ignore feedback
 
-  local function merge(dst, src)
-    for k, v in pairs(src) do
-      if isTable(v) and isTable(dst[k]) and #v == 0 and next(v) ~= nil then
-        merge(dst[k], v)
-      else
-        dst[k] = v
+  local function category(d)
+    if hasType(d, 8) then
+      local f = d.colour and d.colour.features
+      if f then
+        local parts = {}
+        if (f >> 1) & 1 == 1 then parts[#parts + 1] = "Tc" end
+        local ch = (f >> 5) & 7
+        if ch >= 4 then parts[#parts + 1] = "RGBW" elseif ch >= 3 then parts[#parts + 1] = "RGB"
+        elseif ch > 0 then parts[#parts + 1] = ch .. "ch" end
+        if f & 1 == 1 then parts[#parts + 1] = "xy" end
+        if #parts > 0 then return "DT8 " .. table.concat(parts, "+") end
       end
+      return "DT8"
     end
+    if hasType(d, 7) then return "Relay" end
+    if hasType(d, 6) then return "DT6" end
+    for _, t in ipairs(d.types or {}) do if t < 49 then return "DT" .. t end end
+    return d.types and #d.types > 0 and "DT?" or "?"
   end
 
-  local function featureStatus(d, name)
-    local f = isTable(d.features) and d.features[name]
-    if isTable(f) then return f.status end
+  local function summarise(list)
+    local counts, order = {}, {}
+    for _, a in ipairs(list) do
+      local c = category(devices[a])
+      if not counts[c] then counts[c] = 0; order[#order + 1] = c end
+      counts[c] = counts[c] + 1
+    end
+    table.sort(order)
+    local out = {}
+    for _, c in ipairs(order) do out[#out + 1] = counts[c] .. "x " .. c end
+    return table.concat(out, ", ")
+  end
+
+  local function faultOf(a, d)
+    if (d.misses or 0) >= MISSING_AFTER then return "A" .. a .. " missing" end
+    local s = d.status
+    if s then
+      if s & 1 == 1 then return "A" .. a .. " gear failure" end
+      if (s >> 1) & 1 == 1 then return "A" .. a .. " lamp failure" end
+    end
     return nil
   end
 
-  local function inGroup(d, g)
-    if not isTable(d.groups) then return false end
-    for _, x in ipairs(d.groups) do if x == g then return true end end
-    return false
-  end
-
-  function RecomputeGroups()
-    local total = 0
-    for _ in pairs(devices) do total = total + 1 end
-    Controls.DeviceCount.String = tostring(total)
+  function RecomputeRows()
+    local total, all = 0, {}
+    for a in pairs(devices) do total = total + 1; all[#all + 1] = a end
+    Controls.DeviceCount.String = scanned and tostring(total) or "-"
+    Controls.BusTypes.String = scanned and summarise(all) or ""
     for i = 1, ROWS do
-      local g = groupNumber(i)
       local p = "Group" .. i
-      if g == nil then
+      local t = rowTarget(i)
+      if t == nil or not scanned then
         Controls[p .. "Members"].String = "-"
+        Controls[p .. "Types"].String = ""
       else
-        local count, on, level, kelvin = 0, false, 0, nil
-        for _, d in pairs(devices) do
-          if inGroup(d, g) then
-            count = count + 1
-            local sw = featureStatus(d, "switchable")
-            local lv = featureStatus(d, "dimmable")
-            if sw == true then on = true end
-            if type(lv) == "number" and lv > level then level = lv end
-            local k = featureStatus(d, "colorKelvin")
-            if type(k) == "number" then kelvin = k end
+        local list = members(t)
+        local known, maxArc, faults = false, 0, {}
+        for _, a in ipairs(list) do
+          local d = devices[a]
+          if d.arc then known = true; if d.arc > maxArc then maxArc = d.arc end end
+          local f = faultOf(a, d)
+          if f then faults[#faults + 1] = f end
+        end
+        Controls[p .. "Members"].String = tostring(#list)
+        Controls[p .. "Types"].String = summarise(list)
+        Controls[p .. "Fault"].Boolean = #faults > 0
+        Controls[p .. "FaultText"].String = (#faults > 2) and (#faults .. " faults") or table.concat(faults, ", ")
+        if known and not levelHold[i] then
+          Controls[p .. "On"].Boolean = maxArc > 0
+          -- Keep the fader where the user left it if that already maps to this arc level.
+          if PercentToArc(Controls[p .. "Level"].Value) ~= maxArc then
+            Controls[p .. "Level"].Value = ArcToPercent(maxArc)
           end
         end
-        Controls[p .. "Members"].String = tostring(count)
-        Controls[p .. "On"].Boolean = on
-        if not levelHold[i] then
-          Controls[p .. "Level"].Value = on and level or 0
-          if TW and kelvin then Controls[p .. "Kelvin"].Value = kelvin end
+        if not colourHold[i] then
+          for _, a in ipairs(list) do
+            local c = devices[a].colour
+            if c then
+              if O.tw and c.tc then Controls[p .. "Kelvin"].Value = clamp(math.floor(1000000 / c.tc + 0.5), O.kmin, O.kmax) end
+              if O.rgbw and c.rgbw then
+                for k, ch in ipairs(RGBW) do
+                  if c.rgbw[k] then Controls[p .. ch].Value = math.floor(c.rgbw[k] * 100 / 254 + 0.5) end
+                end
+              end
+              break -- first DT8 fitting with colour data represents the row
+            end
+          end
         end
       end
     end
   end
 
-  function LoadDevices(list)
-    if not isTable(list) then return end
-    devices = {}
-    for _, d in ipairs(list) do
-      if isTable(d) and d.id ~= nil then devices[d.id] = d end
-    end
-    RecomputeGroups()
+  local function readLevel(a)
+    ask(a, Q_ACTUAL_LEVEL, function(v)
+      local d = devices[a]
+      if not d then return end
+      local wasMissing = (d.misses or 0) >= MISSING_AFTER
+      if v == nil then
+        d.misses = (d.misses or 0) + 1
+        if d.misses == MISSING_AFTER then RecomputeRows() end
+        return -- keep the last known level
+      end
+      d.misses = 0
+      if v ~= MASK then d.arc = v end -- MASK = lamp failure / unknown
+      RecomputeRows()
+      if wasMissing then dbg("A" .. a .. " answering again") end
+    end)
   end
 
-  function UpdateDevices(list)
-    if not isTable(list) then return end
-    for _, d in ipairs(list) do
-      if isTable(d) and d.id ~= nil then
-        if devices[d.id] then merge(devices[d.id], d) else devices[d.id] = d end
-      end
-    end
-    RecomputeGroups()
+  local function readStatus(a)
+    ask(a, Q_STATUS, function(v)
+      local d = devices[a]
+      if d and v ~= nil then d.status = v; RecomputeRows() end
+    end)
   end
 
-  local function fetchAll()
-    get("/info", function(info)
-      if isTable(info) then
-        Controls.GatewayName.String = tostring(info.name or "")
-        Controls.Firmware.String = tostring(info.version or "")
+  local function readColour(a)
+    local d = devices[a]
+    local f = d and d.colour and d.colour.features
+    if not f then return end
+    if O.tw and (f >> 1) & 1 == 1 then
+      askColour16(a, CV_TC, function(v) if v and v > 0 then d.colour.tc = v; RecomputeRows() end end)
+    end
+    if O.rgbw and ((f >> 5) & 7) >= 3 then
+      d.colour.rgbw = d.colour.rgbw or {}
+      local sel = { CV_RED, CV_GREEN, CV_BLUE, CV_WHITE }
+      for k = 1, (((f >> 5) & 7) >= 4) and 4 or 3 do
+        askColour8(a, sel[k], function(v) if v then d.colour.rgbw[k] = v; RecomputeRows() end end)
       end
-    end)
-    get("/devices", function(obj, code, err)
-      if isTable(obj) and isTable(obj.devices) then
-        LoadDevices(obj.devices)
-        if wsUp then setStatus(0, "") else setStatus(1, "Polling (WebSocket down)") end
-      else
-        setStatus(2, "Gateway not responding (" .. tostring(code or err) .. ")")
+    end
+  end
+
+  local function rowAddresses()
+    local set = {}
+    for i = 1, ROWS do
+      local t = rowTarget(i)
+      if t then for _, a in ipairs(members(t)) do set[a] = i end end
+    end
+    return set
+  end
+
+  -- Read the level of every fitting in target t (nil = every fitting used by a row).
+  local function pollLevels(t)
+    if t then for _, a in ipairs(members(t)) do readLevel(a) end
+    else for a in pairs(rowAddresses()) do readLevel(a) end end
+  end
+
+  local function pollColour(t)
+    if not (O.tw or O.rgbw) then return end
+    local rows = {}
+    if t then rows[1] = t else for i = 1, ROWS do rows[#rows + 1] = rowTarget(i) end end
+    for _, rt in ipairs(rows) do
+      for _, a in ipairs(members(rt)) do
+        if devices[a].colour and devices[a].colour.features then readColour(a); break end
       end
-    end)
+    end
+  end
+
+  local function pollSoon(t, colour)
+    Timer.CallAfter(function() pollLevels(t) end, 0.4)
+    Timer.CallAfter(function() pollLevels(t); if colour then pollColour(t) end end, FADE_S)
+  end
+
+  -- Scan short addresses 0-63: who answers, their groups, device types and DT8 colour features.
+  function Scan()
+    local found, pending = {}, 0
+    if not scanned then setStatus(5, "Scanning DALI bus") end
+    local function step(delta)
+      pending = pending + delta
+      if pending > 0 then return end
+      devices = found
+      scanned = true
+      lastRescan = os.time()
+      local n = 0
+      for _ in pairs(devices) do n = n + 1 end
+      dbg("scan complete,", n, "fittings")
+      if n == 0 then setStatus(1, "No DALI fittings answered") else setStatus(0, "") end
+      RecomputeRows()
+      for a in pairs(rowAddresses()) do readStatus(a) end
+      pollColour(nil)
+    end
+    local function readColourFeatures(a, d)
+      step(1)
+      query({ { ENABLE_DT, 8 }, { shortCmd(a), DT8_Q_FEATURES, true } }, a .. ":dt8f", function(f)
+        if f[2] then d.colour = { features = f[2] } end
+        step(-1)
+      end)
+    end
+    -- QUERY DEVICE TYPE; if the answer is MASK (several types), DALI-2 gear lists them with
+    -- QUERY NEXT DEVICE TYPE until 254. NEXT only works directly after QUERY DEVICE TYPE / NEXT
+    -- to the same gear (any frame in between restarts the list), so it is one atomic sequence.
+    local MAX_TYPES = 8
+    local function readTypes(a, d)
+      local frames = { { shortCmd(a), Q_DEVICE_TYPE, true } }
+      for _ = 1, MAX_TYPES + 1 do frames[#frames + 1] = { shortCmd(a), Q_NEXT_DEVICE_TYPE, true } end
+      step(1)
+      query(frames, a .. ":types", function(ans)
+        local dt = ans[1]
+        if dt ~= nil and dt ~= MASK then
+          d.types = { dt }
+        elseif dt == MASK then
+          for k = 2, #frames do
+            local t = ans[k]
+            if t == nil or t == 254 or t == MASK then break end
+            d.types[#d.types + 1] = t
+          end
+        end
+        if hasType(d, 8) then readColourFeatures(a, d) end
+        step(-1)
+      end, function(idx, answer)
+        if idx == 1 then return answer ~= MASK end      -- single type (or no answer): done
+        return answer == nil or answer == 254 or answer == MASK
+      end)
+    end
+    step(64)
+    for a = 0, 63 do
+      ask(a, Q_ACTUAL_LEVEL, function(v)
+        if v ~= nil then
+          local d = { groups = {}, arc = (v ~= MASK) and v or nil, types = {}, misses = 0 }
+          found[a] = d
+          step(2)
+          ask(a, Q_GROUPS_0_7, function(bits)
+            if bits then for b = 0, 7 do if (bits >> b) & 1 == 1 then d.groups[b] = true end end end
+            step(-1)
+          end)
+          ask(a, Q_GROUPS_8_15, function(bits)
+            if bits then for b = 0, 7 do if (bits >> b) & 1 == 1 then d.groups[b + 8] = true end end end
+            step(-1)
+          end)
+          readTypes(a, d)
+        end
+        step(-1)
+      end)
+    end
   end
 
   ---------------------------------------------------------------------------
@@ -294,7 +624,49 @@ if Controls then
     local s = DaliSocket
     DaliSocket = nil
     generation = generation + 1
+    frameTimer:Stop()
+    local e = inFlight
+    inFlight = nil
+    cmdQueue, queryQueue = {}, {}
+    if e and e.cb then e.cb(e.answers or {}, false) end
     if s then pcall(function() s:Close() end) end
+  end
+
+  local function handleMessage(msg)
+    local t, d = msg.type, msg.data
+    if not isTable(d) then return end
+    if t == "daliFrame" then
+      -- Transmit result for the frame in flight. A command frame is done once sent; a query
+      -- waits for its daliAnswer unless the send failed.
+      if inFlight then
+        local f = inFlight.frames[inFlight.idx]
+        if d.result ~= 0 then
+          dbg("frame failed, result", d.result)
+          if f[3] then frameDone(nil) else finishEntry(false) end
+        elseif not f[3] then
+          frameDone(nil)
+        end
+      end
+    elseif t == "daliAnswer" then
+      if inFlight then
+        local f = inFlight.frames[inFlight.idx]
+        if not f[3] then return end
+        local q = d.queryData
+        if isTable(q) and (q[1] ~= f[1] or q[2] ~= f[2]) then return end -- not ours
+        if d.result == ANSWER_8BIT and type(d.daliData) == "number" then frameDone(d.daliData) else frameDone(nil) end
+      end
+    elseif t == "daliMonitor" then
+      -- A forward frame from another DALI master on the bus (wall push-button coupler,
+      -- another controller): re-read levels shortly.
+      if d.externalSource == true and (d.bits == 16 or d.bits == 24) then pollSoon(nil, true) end
+    elseif t == "info" then
+      Controls.GatewayName.String = tostring(d.name or "")
+      Controls.Firmware.String = tostring(d.version or "")
+      local line = isTable(d.lines) and d.lines["0"]
+      if isTable(line) and line.lineStatus and line.lineStatus ~= "ok" then
+        setStatus(1, "DALI line " .. tostring(line.lineStatus))
+      end
+    end
   end
 
   function Connect()
@@ -312,102 +684,146 @@ if Controls then
       if gen ~= generation then return end
       wsUp = true
       dbg("websocket connected")
-      -- We do not need raw bus traffic.
-      s:Write(rapidjson.encode({ type = "filtering", data = { daliMonitor = true } }), false)
-      fetchAll()
+      Scan()
     end
     s.Data = function(_, data)
       if gen ~= generation then return end
       local ok, msg = pcall(rapidjson.decode, data)
-      if not ok or not isTable(msg) then return end
-      if msg.type == "devices" and isTable(msg.data) then
-        UpdateDevices(msg.data.devices)
-      elseif msg.type == "devicesDeleted" then
-        fetchAll()
-      elseif msg.type == "info" and isTable(msg.data) then
-        Controls.GatewayName.String = tostring(msg.data.name or "")
-        Controls.Firmware.String = tostring(msg.data.version or "")
-      end
+      if ok and isTable(msg) then handleMessage(msg) end
     end
     local function lost(why)
       if gen ~= generation then return end
       dbg("websocket lost:", why)
       dropSocket()
-      setStatus(1, "WebSocket " .. why .. ", polling")
+      setStatus(2, "Gateway " .. why .. ", reconnecting")
       reconnectTimer:Start(RECONNECT_S)
     end
     s.Error = function(_, err) lost("error: " .. tostring(err)) end
-    s.Closed = function() lost("closed") end
+    s.Closed = function() lost("disconnected") end
     s:Connect("ws", ip(), "/", PORT)
   end
 
   reconnectTimer.EventHandler = function() reconnectTimer:Stop(); Connect() end
 
-  -- Poll while the WebSocket is down; ping it while it is up.
+  local cycle = 0
   pollTimer.EventHandler = function()
-    if wsUp and DaliSocket then
-      pcall(function() DaliSocket:Ping() end)
-    else
-      fetchAll()
-    end
+    if not (wsUp and DaliSocket and scanned) then return end
+    if os.time() - lastRescan >= RESCAN_S then Scan() return end
+    cycle = cycle + 1
+    pollLevels(nil)
+    if cycle % STATUS_EVERY == 0 then for a in pairs(rowAddresses()) do readStatus(a) end end
+    if cycle % COLOUR_EVERY == 0 then pollColour(nil) end
+    if (cycle * POLL_S) % PING_S == 0 then pcall(function() DaliSocket:Ping() end) end
   end
   pollTimer:Start(POLL_S)
 
   ---------------------------------------------------------------------------
   -- Controls
   ---------------------------------------------------------------------------
-  local function control(i, body)
-    local g = groupNumber(i)
-    if g == nil then
-      setStatus(1, "Group row " .. i .. " has no DALI group number")
-      return
-    end
-    post("/group/" .. g .. "/control", body)
+  local lastOnLevel = {} -- per row: percent to restore when switched on
+
+  local function target(i)
+    local t = rowTarget(i)
+    if t == nil then setStatus(1, "Row " .. i .. ": address must be G0-15, A0-63 or BC") end
+    return t
   end
 
-  local throttles = {}
-  local function throttled(i, send)
-    local t = throttles[i]
-    if not t then
-      t = { timer = Timer.New(), release = Timer.New(), busy = false }
-      t.timer.EventHandler = function()
-        t.timer:Stop()
-        if t.pending then local f = t.pending; t.pending = nil; f(); t.timer:Start(0.2) else t.busy = false end
-      end
-      t.release.EventHandler = function() t.release:Stop(); levelHold[i] = nil end
-      throttles[i] = t
+  local function assumeArc(t, arc)
+    for a, d in pairs(devices) do if inTarget(t, a, d) then d.arc = arc end end
+  end
+
+  local function keyOf(t, what) return what .. ":" .. t.kind .. ":" .. tostring(t.n) end
+
+  local function setLevel(i, pct)
+    local t = target(i)
+    if t == nil then return end
+    if pct <= 0 then
+      command({ { addrByte(t, true), CMD_OFF } }, keyOf(t, "lvl"))
+      assumeArc(t, 0)
+    else
+      lastOnLevel[i] = pct
+      command({ { addrByte(t, false), PercentToArc(pct) } }, keyOf(t, "lvl"))
+      assumeArc(t, PercentToArc(pct))
     end
-    levelHold[i] = true
-    t.release:Stop(); t.release:Start(2)
-    if t.busy then t.pending = send else t.busy = true; send(); t.timer:Start(0.2) end
+    pollSoon(t)
+  end
+
+  local function makeThrottle(hold)
+    local list = {}
+    return function(i, send)
+      local th = list[i]
+      if not th then
+        th = { timer = Timer.New(), release = Timer.New(), busy = false }
+        th.timer.EventHandler = function()
+          th.timer:Stop()
+          if th.pending then local f = th.pending; th.pending = nil; f(); th.timer:Start(0.2) else th.busy = false end
+        end
+        th.release.EventHandler = function() th.release:Stop(); hold[i] = nil end
+        list[i] = th
+      end
+      hold[i] = true
+      th.release:Stop(); th.release:Start(FADE_S + 0.5)
+      if th.busy then th.pending = send else th.busy = true; send(); th.timer:Start(0.2) end
+    end
+  end
+  local throttled = makeThrottle(levelHold)
+  local colourThrottled = makeThrottle(colourHold)
+
+  -- DT8 Tc: DTR1:DTR0 = mirek, SET TEMPORARY COLOUR TEMPERATURE, ACTIVATE.
+  local function sendKelvin(i)
+    local t = target(i)
+    if t == nil then return end
+    local mirek = math.floor(1000000 / Controls["Group" .. i .. "Kelvin"].Value + 0.5)
+    local a = addrByte(t, true)
+    command({ { DTR0, mirek & 0xFF }, { DTR1, (mirek >> 8) & 0xFF }, { ENABLE_DT, 8 }, { a, DT8_SET_TC },
+              { ENABLE_DT, 8 }, { a, DT8_ACTIVATE } }, keyOf(t, "tc"))
+    for _, m in ipairs(members(t)) do local c = devices[m].colour; if c then c.tc = mirek end end
+    pollSoon(t, true)
+  end
+
+  -- DT8 RGBWAF: DTR0/1/2 = R,G,B -> SET TEMPORARY RGB DIMLEVEL; DTR0 = W (A, F unchanged) ->
+  -- SET TEMPORARY WAF DIMLEVEL; ACTIVATE. 255 (MASK) leaves a channel unchanged.
+  local function sendRgbw(i)
+    local t = target(i)
+    if t == nil then return end
+    local p = "Group" .. i
+    local v = {}
+    for k, ch in ipairs(RGBW) do v[k] = math.floor(clamp(Controls[p .. ch].Value, 0, 100) * 254 / 100 + 0.5) end
+    local a = addrByte(t, true)
+    command({ { DTR0, v[1] }, { DTR1, v[2] }, { DTR2, v[3] }, { ENABLE_DT, 8 }, { a, DT8_SET_RGB },
+              { DTR0, v[4] }, { DTR1, MASK }, { DTR2, MASK }, { ENABLE_DT, 8 }, { a, DT8_SET_WAF },
+              { ENABLE_DT, 8 }, { a, DT8_ACTIVATE } }, keyOf(t, "rgbw"))
+    pollSoon(t, true)
   end
 
   for i = 1, ROWS do
     local p = "Group" .. i
-    if Controls[p .. "Address"].String == "" then Controls[p .. "Address"].String = tostring(i - 1) end
-    Controls[p .. "Address"].EventHandler = function() RecomputeGroups() end
+    if Controls[p .. "Address"].String == "" then Controls[p .. "Address"].String = "G" .. (i - 1) end
+    Controls[p .. "Address"].EventHandler = function()
+      RecomputeRows()
+      local t = rowTarget(i)
+      if t then pollLevels(t); for _, a in ipairs(members(t)) do readStatus(a) end; pollColour(t) end
+    end
 
     Controls[p .. "On"].EventHandler = function(c)
-      control(i, { switchable = c.Boolean })
+      local pct = c.Boolean and (lastOnLevel[i] or 100) or 0
+      Controls[p .. "Level"].Value = pct
+      throttled(i, function() setLevel(i, pct) end)
     end
 
     Controls[p .. "Level"].EventHandler = function(c)
       Controls[p .. "On"].Boolean = c.Value > 0
-      throttled(i, function()
-        control(i, { dimmable = math.floor(Controls[p .. "Level"].Value + 0.5) })
-      end)
+      throttled(i, function() setLevel(i, Controls[p .. "Level"].Value) end)
     end
 
     -- Raise / Lower: step the level while held.
     local ramp = Timer.New()
     local dir = 0
     ramp.EventHandler = function()
-      local lvl = Controls[p .. "Level"].Value + dir * RAMP_STEP
-      if lvl < 1 then lvl = 1 end
-      if lvl > 100 then lvl = 100 end
+      local lvl = clamp(Controls[p .. "Level"].Value + dir * RAMP_STEP, 1, 100)
       Controls[p .. "Level"].Value = lvl
       Controls[p .. "On"].Boolean = true
-      throttled(i, function() control(i, { dimmable = math.floor(lvl + 0.5) }) end)
+      throttled(i, function() setLevel(i, lvl) end)
     end
     local function rampButton(c, d)
       if c.Boolean then dir = d; ramp.EventHandler(); ramp:Start(RAMP_S) else ramp:Stop() end
@@ -416,21 +832,30 @@ if Controls then
     Controls[p .. "Lower"].EventHandler = function(c) rampButton(c, -1) end
 
     Controls[p .. "Recall"].EventHandler = function()
-      control(i, { scene = math.floor(Controls[p .. "Scene"].Value) })
+      local t = target(i)
+      if t == nil then return end
+      local scene = clamp(math.floor(Controls[p .. "Scene"].Value), 0, 15)
+      command({ { addrByte(t, true), CMD_GOTO_SCENE + scene } })
+      pollSoon(t, true)
     end
 
-    if TW then
-      Controls[p .. "Kelvin"].EventHandler = function(c)
-        throttled(i, function()
-          control(i, { colorKelvin = math.floor(Controls[p .. "Kelvin"].Value) })
-        end)
+    if O.tw then
+      Controls[p .. "Kelvin"].EventHandler = function() colourThrottled(i, function() sendKelvin(i) end) end
+    end
+    if O.rgbw then
+      for _, ch in ipairs(RGBW) do
+        Controls[p .. ch].EventHandler = function() colourThrottled(i, function() sendRgbw(i) end) end
       end
     end
   end
 
-  Controls.AllOn.EventHandler = function() post("/broadcast/control", { switchable = true }) end
-  Controls.AllOff.EventHandler = function() post("/broadcast/control", { switchable = false }) end
-  Controls.Refresh.EventHandler = function() fetchAll() end
+  Controls.AllOn.EventHandler = function()
+    command({ { 0xFE, 254 } }); assumeArc({ kind = "bc" }, 254); RecomputeRows(); pollSoon(nil)
+  end
+  Controls.AllOff.EventHandler = function()
+    command({ { 0xFF, CMD_OFF } }); assumeArc({ kind = "bc" }, 0); RecomputeRows(); pollSoon(nil)
+  end
+  Controls.Refresh.EventHandler = function() if wsUp then Scan() else Connect() end end
   Controls.IPAddress.EventHandler = function() Connect() end
 
   Connect()

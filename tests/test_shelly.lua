@@ -111,6 +111,56 @@ ok(Controls.Status.Value == 4 and not Controls.Online.Boolean, "closed -> missin
 Q.advance(5)
 ok(Q.socket() ~= s2, "reconnect after close")
 
+-- Presence Gen4 (frames captured from a real S4SN-0U61X, fw 2.2.0, on 2026-11-25).
+Q.load(PLUGIN, { ["Switches"] = 0, ["Inputs"] = 0, ["Power Metering"] = false, ["Presence Zones"] = 2, ["Illuminance"] = true })
+Controls.IPAddress.String = "192.168.61.207"
+Q.run(PLUGIN)
+local ps = Q.socket()
+ps.Connected(ps)
+local byMethod = {}
+for _, raw in ipairs(ps.sent) do local x = Q.json.decode(raw); byMethod[x.method] = x end
+ok(byMethod["Shelly.GetStatus"] and byMethod["Presence.GetConfig"], "presence: reads status and presence config on connect")
+Q.recv({ id = byMethod["Shelly.GetStatus"].id, result = {
+  ["illuminance:0"] = { id = 0, illumination = "dark" }, presence = { sensor_ver = "1.0" }, sys = { uptime = 1 } } }, ps)
+ok(Controls.Illuminance.String == "dark" and Controls.Status.Value == 0, "illuminance from GetStatus")
+Q.recv({ id = byMethod["Presence.GetConfig"].id, result = { enable = true, main_zone = "presencezone:201" } }, ps)
+local gc = Q.sent(ps)
+ok(gc.method == "Shelly.GetComponents" and gc.params.dynamic_only == true, "zones read with Shelly.GetComponents (not in GetStatus)")
+Q.recv({ id = gc.id, result = { components = {
+  { key = "presencezone:200", status = { id = 200, value = false, num_objects = 0 }, config = { id = 200, name = "Room" } },
+  { key = "presencezone:201", status = { id = 201, value = true, num_objects = 2 }, config = { id = 201, name = "Table" } },
+}, offset = 0, total = 2 } }, ps)
+ok(Controls.Zone1Name.String == "Table" and Controls.Zone1Occupied.Boolean and Controls.Zone1Objects.Value == 2, "main zone is zone 1")
+ok(Controls.Zone2Name.String == "Room" and not Controls.Zone2Occupied.Boolean, "other zones follow")
+Q.recv({ src = "shellypresence", dst = "qsys", method = "NotifyStatus", params = { ts = 1, ["presencezone:200"] = { value = true, num_objects = 1 } } }, ps)
+ok(Controls.Zone2Occupied.Boolean and Controls.Zone2Objects.Value == 1, "NotifyStatus updates a zone")
+Q.recv({ method = "NotifyStatus", params = { ["presencezone:999"] = { value = true } } }, ps)
+ok(true, "unknown zone ids are ignored")
+Q.recv({ method = "NotifyStatus", params = { ts = 2, ["illuminance:0"] = { illumination = "twilight" } } }, ps)
+ok(Controls.Illuminance.String == "twilight", "illuminance NotifyStatus")
+Q.recv({ method = "NotifyStatus", params = { ["illuminance:0"] = { lux = 152.4, illumination = "bright" } } }, ps)
+ok(Controls.Illuminance.String == "152 lx (bright)", "lux shown when the firmware reports it")
+-- Heartbeat re-reads zones (they are not part of Shelly.GetStatus).
+local before = #ps.sent
+Q.advance(10)
+local zonesPolled = false
+for i = before + 1, #ps.sent do if Q.json.decode(ps.sent[i]).method == "Shelly.GetComponents" then zonesPolled = true end end
+ok(zonesPolled, "heartbeat re-reads presence zones")
+-- A sensor with fewer zones than configured.
+local gc2
+for i = #ps.sent, 1, -1 do local x = Q.json.decode(ps.sent[i]); if x.method == "Shelly.GetComponents" then gc2 = x; break end end
+Q.recv({ id = gc2.id, result = { components = {
+  { key = "presencezone:200", status = { id = 200, value = false, num_objects = 0 }, config = { id = 200, name = "Room" } } } } }, ps)
+ok(Controls.Zone1Name.String == "Room" and Controls.Zone2Name.String == "(no zone)", "missing zones marked")
+-- A switch-only device sends no presence calls.
+Q.load(PLUGIN, {})
+Controls.IPAddress.String = "192.168.60.224"
+Q.run(PLUGIN)
+Q.socket().Connected(Q.socket())
+local anyPresence = false
+for _, raw in ipairs(Q.socket().sent) do local mth = Q.json.decode(raw).method; if mth:find("Presence") or mth == "Shelly.GetComponents" then anyPresence = true end end
+ok(not anyPresence, "no presence calls when Presence Zones = 0")
+
 -- No IP.
 Q.load(PLUGIN, {})
 Q.run(PLUGIN)

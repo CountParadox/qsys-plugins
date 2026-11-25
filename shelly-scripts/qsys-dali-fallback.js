@@ -1,5 +1,10 @@
 // Q-SYS fallback for DALI wall switches. Runs on the Shelly (Settings > Scripts).
 //
+// REQUIRES a gateway with the DALI-2 IoT REST API (POST /group/{n}/control, GET /device/{id}).
+// The Atios SmartCore on site (192.168.60.14, fw 3.2.64, DALI IP interface) has no REST API:
+// those paths return 404, and Shelly scripts cannot open the WebSocket it uses instead.
+// Do not install this against the SmartCore; it would fail silently when the Core is down.
+//
 // Normally Q-SYS handles the switch: the input is "Detached" and the Shelly plugin
 // forwards the presses. Q-SYS also calls this script's "hb" endpoint every 10 s
 // (set the plugin's "Fallback Heartbeat Path" to /script/<script id>/hb).
